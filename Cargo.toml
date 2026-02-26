@@ -1,0 +1,9 @@
+[workspace]
+members = [
+  "crates/server",
+  "crates/narwhal-core",
+  "crates/media",
+  "crates/proto",
+  "bins/narwhald",
+]
+resolver = "2"
