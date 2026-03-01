@@ -1,0 +1,168 @@
+digraph narwhal_architecture {
+    graph [
+        rankdir=LR,
+        splines=true,
+        nodesep=0.45,
+        ranksep=0.8,
+        pad=0.2,
+        fontname="Helvetica",
+        fontsize=12,
+        labelloc="t",
+        label="Narwhal Current Architecture and Flow"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="Helvetica",
+        fontsize=11,
+        color="#314158",
+        fillcolor="#f7f4ec",
+        margin="0.14,0.08"
+    ];
+
+    edge [
+        color="#52627a",
+        fontname="Helvetica",
+        fontsize=10,
+        arrowsize=0.8
+    ];
+
+    subgraph cluster_browser {
+        label="Browser Demo Client";
+        color="#c9b68c";
+        style="rounded";
+
+        browser_pub [
+            label="Publisher Browser\nclients/app.js\nRTCPeerConnection + getUserMedia",
+            fillcolor="#fdf1d4"
+        ];
+
+        browser_sub [
+            label="Subscriber Browser\nclients/app.js\nRTCPeerConnection",
+            fillcolor="#fdf1d4"
+        ];
+    }
+
+    subgraph cluster_server {
+        label="HTTP Layer";
+        color="#90a4ae";
+        style="rounded";
+
+        main_bin [
+            label="narwhald\nbins/narwhald/src/main.rs\nbootstraps server + runtime",
+            fillcolor="#eaf4f8"
+        ];
+
+        axum_server [
+            label="server::app()\ncrates/server/src/lib.rs\nWHIP/WHEP-style routes",
+            fillcolor="#eaf4f8"
+        ];
+    }
+
+    subgraph cluster_core {
+        label="Core Orchestration";
+        color="#8fb996";
+        style="rounded";
+
+        room_manager [
+            label="RoomManager\nroom.rs\nowns all rooms",
+            fillcolor="#eef8ec"
+        ];
+
+        room_state [
+            label="RoomState\npublisher + subscribers + router",
+            fillcolor="#eef8ec"
+        ];
+
+        pub_session [
+            label="PublisherSession\npeer + IceQueue",
+            fillcolor="#eef8ec"
+        ];
+
+        sub_session [
+            label="SubscriberSession\npeer + IceQueue",
+            fillcolor="#eef8ec"
+        ];
+
+        ice_queue [
+            label="IceQueue\nbuffers server ICE for polling",
+            fillcolor="#eef8ec"
+        ];
+
+        router [
+            label="BroadcastRouter\nfanout RTP + cache stream info",
+            fillcolor="#eef8ec"
+        ];
+    }
+
+    subgraph cluster_media {
+        label="Media / GStreamer";
+        color="#c48b9f";
+        style="rounded";
+
+        gst_runtime [
+            label="GstRuntime\nruntime.rs\nGLib thread executor",
+            fillcolor="#f9edf1"
+        ];
+
+        peer_pub [
+            label="PeerSession\nWhipPublisher",
+            fillcolor="#f9edf1"
+        ];
+
+        peer_sub [
+            label="PeerSession\nWhepSubscriber",
+            fillcolor="#f9edf1"
+        ];
+
+        rtp_tap [
+            label="RTP Tap\ninstall_rtp_tap()",
+            fillcolor="#f9edf1"
+        ];
+
+        rtp_injector [
+            label="RTP Injector\ninstall_rtp_injector()",
+            fillcolor="#f9edf1"
+        ];
+    }
+
+    main_bin -> axum_server [label="mount routes"];
+    main_bin -> gst_runtime [label="init()"];
+    main_bin -> room_manager [label="RoomManager::new()"];
+
+    browser_pub -> axum_server [label="POST /whip/:room\nSDP offer"];
+    browser_pub -> axum_server [label="PATCH /whip/:room/:pub\nICE candidate"];
+    axum_server -> browser_pub [label="201 Created\nanswer SDP + Location"];
+    axum_server -> browser_pub [label="GET /whip/:room/:pub/ice\nserver ICE"];
+
+    browser_sub -> axum_server [label="POST /whep/:room\nSDP offer"];
+    browser_sub -> axum_server [label="PATCH /whep/:room/:sub\nICE candidate"];
+    axum_server -> browser_sub [label="201 Created\nanswer SDP + Location"];
+    axum_server -> browser_sub [label="GET /whep/:room/:sub/ice\nserver ICE"];
+
+    axum_server -> room_manager [label="translate HTTP to core calls"];
+    room_manager -> room_state [label="create / lookup room"];
+    room_state -> pub_session [label="0..1 publisher"];
+    room_state -> sub_session [label="0..N subscribers"];
+    room_state -> router [label="1 router"];
+
+    pub_session -> ice_queue [label="store outgoing ICE"];
+    sub_session -> ice_queue [label="store outgoing ICE"];
+
+    room_manager -> peer_pub [label="PeerSession::new()\nstart/negotiate/play"];
+    room_manager -> peer_sub [label="PeerSession::new()\nset streams\nstart/negotiate/play"];
+
+    gst_runtime -> peer_pub [label="execute on GLib thread"];
+    gst_runtime -> peer_sub [label="execute on GLib thread"];
+
+    peer_pub -> rtp_tap [label="extract inbound RTP"];
+    rtp_tap -> router [label="fanout task sends packets"];
+    router -> rtp_injector [label="deliver cloned RTP"];
+    rtp_injector -> peer_sub [label="feed webrtcbin sink pads"];
+
+    router -> peer_sub [style=dashed, label="stream_infos() used\nbefore negotiation"];
+
+    pub_session -> peer_pub [style=dotted, label="owns"];
+    sub_session -> peer_sub [style=dotted, label="owns"];
+}

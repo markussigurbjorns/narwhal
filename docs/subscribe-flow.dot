@@ -1,0 +1,158 @@
+digraph narwhal_subscribe_flow {
+    graph [
+        rankdir=LR,
+        splines=true,
+        nodesep=0.5,
+        ranksep=0.9,
+        pad=0.2,
+        fontname="Helvetica",
+        fontsize=12,
+        labelloc="t",
+        label="Narwhal Subscribe Flow"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="Helvetica",
+        fontsize=11,
+        color="#314158",
+        fillcolor="#f7f4ec",
+        margin="0.14,0.08"
+    ];
+
+    edge [
+        color="#52627a",
+        fontname="Helvetica",
+        fontsize=10,
+        arrowsize=0.8
+    ];
+
+    browser [
+        label="Browser Subscriber\nclients/app.js\ncreateOffer",
+        fillcolor="#fdf1d4"
+    ];
+
+    route_post [
+        label="POST /whep/:room\nserver::whep_post()",
+        fillcolor="#eaf4f8"
+    ];
+
+    room_manager [
+        label="RoomManager::whep_subscribe()",
+        fillcolor="#eef8ec"
+    ];
+
+    room_state [
+        label="RoomState\npublisher + router + subscribers",
+        fillcolor="#eef8ec"
+    ];
+
+    router_streams [
+        label="BroadcastRouter::stream_infos()",
+        fillcolor="#eef8ec"
+    ];
+
+    peer [
+        label="PeerSession\nWhepSubscriber",
+        fillcolor="#f9edf1"
+    ];
+
+    gst [
+        label="GstRuntime\nGLib thread executor",
+        fillcolor="#f9edf1"
+    ];
+
+    set_streams [
+        label="set_whep_streams(stream_infos)",
+        fillcolor="#f9edf1"
+    ];
+
+    negotiate [
+        label="start()\nthen\nnegotiate_as_answerer()",
+        fillcolor="#f9edf1"
+    ];
+
+    take_injector [
+        label="take_whep_injector()",
+        fillcolor="#f9edf1"
+    ];
+
+    play [
+        label="play()",
+        fillcolor="#f9edf1"
+    ];
+
+    register_sub [
+        label="router.add_sub(sub_id, injector.tx)",
+        fillcolor="#eef8ec"
+    ];
+
+    subscriber_session [
+        label="store SubscriberSession\nin room state",
+        fillcolor="#eef8ec"
+    ];
+
+    ice [
+        label="IceQueue +\nstart_ice_collector()",
+        fillcolor="#eef8ec"
+    ];
+
+    response [
+        label="201 Created\nanswer SDP + Location",
+        fillcolor="#eaf4f8"
+    ];
+
+    patch_route [
+        label="PATCH /whep/:room/:sub\nserver::whep_patch()",
+        fillcolor="#eaf4f8"
+    ];
+
+    get_ice_route [
+        label="GET /whep/:room/:sub/ice\nserver::whep_get_ice()",
+        fillcolor="#eaf4f8"
+    ];
+
+    add_ice [
+        label="PeerSession::add_ice_candidate()",
+        fillcolor="#f9edf1"
+    ];
+
+    drain_ice [
+        label="IceQueue::drain()",
+        fillcolor="#eef8ec"
+    ];
+
+    rtp_feed [
+        label="Subscriber later receives RTP\nthrough registered injector",
+        fillcolor="#f9edf1"
+    ];
+
+    browser -> route_post [label="SDP offer"];
+    route_post -> room_manager [label="whep_subscribe(room, offer)"];
+    room_manager -> room_state [label="require publisher exists"];
+    room_state -> router_streams [label="read cached stream metadata"];
+    room_manager -> peer [label="PeerSession::new()"];
+    gst -> peer [label="runtime backing"];
+    router_streams -> set_streams [label="stream_infos"];
+    peer -> set_streams [label="configure expected media"];
+    set_streams -> negotiate [label="prepare answer"];
+    negotiate -> take_injector [label="injector created during setup"];
+    take_injector -> play [label="ready to receive RTP"];
+    play -> register_sub [label="register injector sender"];
+    register_sub -> rtp_feed [label="BroadcastRouter can fan out packets"];
+    room_manager -> ice [label="subscribe to local ICE"];
+    room_manager -> subscriber_session [label="sub id + peer + ice"];
+    subscriber_session -> response [label="SdpResponse"];
+    response -> browser [label="answer SDP + resource URL"];
+
+    browser -> patch_route [label="local ICE candidate"];
+    patch_route -> room_manager [label="whep_trickle(...)"];
+    room_manager -> add_ice [label="lookup subscriber peer"];
+    add_ice -> peer [label="apply remote ICE"];
+
+    browser -> get_ice_route [label="poll server ICE"];
+    get_ice_route -> room_manager [label="whep_drain_ice(...)"];
+    room_manager -> drain_ice [label="lookup subscriber queue"];
+    drain_ice -> browser [label="ICE candidate list"];
+}
