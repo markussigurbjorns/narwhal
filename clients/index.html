@@ -31,7 +31,7 @@
       }
 
       main {
-        max-width: 1200px;
+        max-width: 1100px;
         margin: 0 auto;
         padding: 24px;
       }
@@ -41,22 +41,49 @@
         letter-spacing: 0.02em;
       }
 
-      .intro {
+      .hero {
         margin-bottom: 24px;
       }
 
-      .grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-        gap: 20px;
+      .hero p {
+        max-width: 60ch;
+      }
+
+      .view {
+        display: none;
+      }
+
+      .view.active {
+        display: block;
       }
 
       .panel {
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 18px;
-        padding: 18px;
+        padding: 20px;
         box-shadow: 0 12px 36px rgba(24, 32, 40, 0.08);
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.7fr);
+        gap: 20px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 20px;
+      }
+
+      .chooser {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 20px;
+      }
+
+      .chooser .panel p {
+        color: var(--muted);
       }
 
       label {
@@ -112,6 +139,8 @@
         background: #0f1720;
         border-radius: 14px;
         border: 1px solid #0000001a;
+        max-height: min(52vh, 420px);
+        object-fit: contain;
       }
 
       pre {
@@ -132,57 +161,131 @@
         font-size: 13px;
         color: var(--muted);
       }
+
+      .invite-box {
+        display: grid;
+        gap: 12px;
+      }
+
+      .invite-box input {
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        font-size: 13px;
+      }
+
+      .badge {
+        display: inline-block;
+        padding: 5px 10px;
+        border-radius: 999px;
+        background: rgba(0, 109, 119, 0.1);
+        color: var(--accent);
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      @media (max-width: 820px) {
+        .split {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 560px) {
+        main {
+          padding: 16px;
+        }
+
+        .panel {
+          padding: 16px;
+        }
+
+        video {
+          max-height: 34vh;
+        }
+
+        pre {
+          min-height: 140px;
+        }
+      }
     </style>
   </head>
   <body>
     <main>
-      <section class="intro">
-        <h1>Narwhal Browser Clients</h1>
-        <p>Use these to publish media with WHIP and subscribe with WHEP against the current Rust server.</p>
-        <p class="meta">Serve this page from the same server and open <code>/clients/</code>.</p>
+      <section class="hero">
+        <span class="badge">Narwhal</span>
+        <h1 id="page-title">Create A Room</h1>
+        <p id="page-description">Start publishing into a room, then send the generated viewer link to subscribers.</p>
       </section>
 
-      <section class="grid">
-        <article class="panel">
-          <h2>WHIP Publisher</h2>
-          <label>
-            Room
-            <input id="pub-room" value="test-room">
-          </label>
-          <label>
-            Base URL
-            <input id="pub-base" value="">
-          </label>
-          <div class="actions">
-            <button id="pub-start">Start Publish</button>
-            <button id="pub-stop" class="danger" disabled>Stop Publish</button>
-          </div>
-          <video id="local-video" autoplay playsinline muted></video>
-          <p class="meta" id="pub-status">Idle</p>
-          <pre id="pub-log"></pre>
-        </article>
+      <section id="view-publish" class="view">
+        <div class="split">
+          <article class="panel">
+            <h2>WHIP Publisher</h2>
+            <label>
+              Room
+              <input id="pub-room" value="test-room">
+            </label>
+            <label>
+              Base URL
+              <input id="pub-base" value="">
+            </label>
+            <div class="actions">
+              <button id="pub-start" type="button">Start Publish</button>
+              <button id="pub-stop" class="danger" type="button" disabled>Stop Publish</button>
+            </div>
+            <video id="local-video" autoplay playsinline muted></video>
+            <p class="meta" id="pub-status">Idle</p>
+            <pre id="pub-log"></pre>
+          </article>
 
-        <article class="panel">
-          <h2>WHEP Subscriber</h2>
-          <label>
-            Room
-            <input id="sub-room" value="test-room">
-          </label>
-          <label>
-            Base URL
-            <input id="sub-base" value="">
-          </label>
-          <div class="actions">
-            <button id="sub-start" class="secondary">Start Subscribe</button>
-            <button id="sub-stop" class="danger" disabled>Stop Subscribe</button>
-          </div>
-          <video id="remote-video" autoplay playsinline controls muted></video>
-          <p class="meta" id="sub-status">Idle</p>
-          <pre id="sub-log"></pre>
-        </article>
+          <aside class="stack">
+            <article class="panel">
+              <h2>Share This Room</h2>
+              <p class="meta">Send this link to WHEP viewers. Subscriber access is only available through this generated link.</p>
+              <div class="invite-box">
+                <input id="pub-share-link" readonly value="">
+                <div class="actions">
+                  <button id="pub-copy-link" class="secondary" type="button">Copy Link</button>
+                  <button id="pub-open-link" type="button">Open Viewer Page</button>
+                </div>
+                <p class="meta" id="pub-share-status">Set a room to generate a subscriber link.</p>
+              </div>
+            </article>
+          </aside>
+        </div>
       </section>
+
+      <section id="view-subscribe" class="view">
+        <div class="split">
+          <article class="panel">
+            <h2>WHEP Subscriber</h2>
+            <label>
+              Room
+              <input id="sub-room" value="test-room">
+            </label>
+            <label>
+              Base URL
+              <input id="sub-base" value="">
+            </label>
+            <div class="actions">
+              <button id="sub-start" class="secondary" type="button">Start Subscribe</button>
+              <button id="sub-stop" class="danger" type="button" disabled>Stop Subscribe</button>
+            </div>
+            <video id="remote-video" autoplay playsinline controls muted></video>
+            <p class="meta" id="sub-status">Idle</p>
+            <pre id="sub-log"></pre>
+          </article>
+
+          <aside class="stack">
+            <article class="panel">
+              <h2>Room Details</h2>
+              <p class="meta">This page opens only from a publisher-generated link.</p>
+              <p class="meta" id="sub-room-summary">No room selected yet.</p>
+            </article>
+          </aside>
+        </div>
+      </section>
+
+      <script type="module" src="./app.js"></script>
     </main>
-
-    <script type="module" src="./app.js"></script>
   </body>
 </html>

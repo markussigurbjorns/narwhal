@@ -47,6 +47,52 @@ function buildUrl(base, path) {
   return new URL(path, base).toString();
 }
 
+function getSearchParams() {
+  return new URLSearchParams(window.location.search);
+}
+
+function currentView(params = getSearchParams()) {
+  const view = params.get("view");
+  if (view === "subscribe" && params.get("room")) {
+    return view;
+  }
+  if (view === "publish") {
+    return view;
+  }
+  return "publish";
+}
+
+function syncViewUrl(view, extra = {}) {
+  const url = new URL(window.location.href);
+  const params = url.searchParams;
+
+  if (view === "subscribe") {
+    params.set("view", view);
+  } else {
+    params.delete("view");
+  }
+
+  for (const [key, value] of Object.entries(extra)) {
+    if (value) {
+      params.set(key, value);
+    } else {
+      params.delete(key);
+    }
+  }
+
+  window.history.replaceState({}, "", url);
+}
+
+function buildSubscriberPageUrl(base, room) {
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("view", "subscribe");
+  url.searchParams.set("room", room);
+  url.searchParams.set("base", base);
+  return url.toString();
+}
+
 async function readError(response) {
   const text = await response.text();
   throw new Error(`${response.status} ${response.statusText}: ${text}`);
@@ -204,11 +250,51 @@ async function flushPendingCandidates(resourceUrl, pendingCandidates, log) {
   }
 }
 
+function wireNavigation() {
+  const title = document.querySelector("#page-title");
+  const description = document.querySelector("#page-description");
+  const views = {
+    publish: document.querySelector("#view-publish"),
+    subscribe: document.querySelector("#view-subscribe"),
+  };
+
+  const copy = {
+    publish: {
+      title: "Create A Room",
+      description: "Start publishing into a room, then send the generated viewer link to subscribers.",
+    },
+    subscribe: {
+      title: "Subscriber View",
+      description: "Connect to a room as a WHEP client through a publisher-generated link.",
+    },
+  };
+
+  function show(view) {
+    for (const [name, el] of Object.entries(views)) {
+      el.classList.toggle("active", name === view);
+    }
+
+    title.textContent = copy[view].title;
+    description.textContent = copy[view].description;
+    if (view === "publish") {
+      syncViewUrl("publish", { room: "", base: "" });
+    }
+  }
+
+  show(currentView());
+
+  return { show };
+}
+
 function wirePublisher() {
   const roomInput = document.querySelector("#pub-room");
   const baseInput = document.querySelector("#pub-base");
   const startButton = document.querySelector("#pub-start");
   const stopButton = document.querySelector("#pub-stop");
+  const shareLinkInput = document.querySelector("#pub-share-link");
+  const shareStatus = document.querySelector("#pub-share-status");
+  const copyLinkButton = document.querySelector("#pub-copy-link");
+  const openLinkButton = document.querySelector("#pub-open-link");
   const video = document.querySelector("#local-video");
   const log = createLogger(
     document.querySelector("#pub-log"),
@@ -223,6 +309,24 @@ function wirePublisher() {
   let resourceUrl = null;
   let stopIcePolling = null;
   let pendingCandidates = [];
+
+  function updateShareLink() {
+    const room = roomInput.value.trim();
+    const base = resolveBase(baseInput);
+
+    if (!room) {
+      shareLinkInput.value = "";
+      shareStatus.textContent = "Set a room to generate a subscriber link.";
+      openLinkButton.disabled = true;
+      copyLinkButton.disabled = true;
+      return;
+    }
+
+    shareLinkInput.value = buildSubscriberPageUrl(base, room);
+    shareStatus.textContent = "Share this viewer link before or after you start publishing.";
+    openLinkButton.disabled = false;
+    copyLinkButton.disabled = false;
+  }
 
   async function stop() {
     if (stopIcePolling) {
@@ -257,6 +361,30 @@ function wirePublisher() {
     log.setStatus("Idle");
     setMediaState({ start: startButton, stop: stopButton }, false);
   }
+
+  roomInput.addEventListener("input", updateShareLink);
+  baseInput.addEventListener("input", updateShareLink);
+
+  copyLinkButton.addEventListener("click", async () => {
+    if (!shareLinkInput.value) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(shareLinkInput.value);
+      shareStatus.textContent = "Subscriber link copied.";
+    } catch (error) {
+      shareStatus.textContent = `Copy failed: ${error.message}`;
+    }
+  });
+
+  openLinkButton.addEventListener("click", () => {
+    if (!shareLinkInput.value) {
+      return;
+    }
+
+    window.open(shareLinkInput.value, "_blank", "noopener,noreferrer");
+  });
 
   startButton.addEventListener("click", async () => {
     try {
@@ -324,6 +452,7 @@ function wirePublisher() {
 
       stopIcePolling = startIcePolling(pc, resourceUrl, log);
       log.setStatus("Publishing");
+      updateShareLink();
     } catch (error) {
       log.log("start failed", { error: error.message });
       await stop();
@@ -337,6 +466,8 @@ function wirePublisher() {
   window.addEventListener("beforeunload", () => {
     stop();
   });
+
+  updateShareLink();
 }
 
 function wireSubscriber() {
@@ -344,6 +475,7 @@ function wireSubscriber() {
   const baseInput = document.querySelector("#sub-base");
   const startButton = document.querySelector("#sub-start");
   const stopButton = document.querySelector("#sub-stop");
+  const roomSummary = document.querySelector("#sub-room-summary");
   const video = document.querySelector("#remote-video");
   const log = createLogger(
     document.querySelector("#sub-log"),
@@ -351,13 +483,27 @@ function wireSubscriber() {
     "SUB"
   );
 
-  baseInput.value = defaultBase;
+  const params = getSearchParams();
+  roomInput.value = params.get("room") || "test-room";
+  baseInput.value = params.get("base") || defaultBase;
 
   let pc = null;
   let resourceUrl = null;
   let stopIcePolling = null;
   let stopStatsPolling = null;
   let pendingCandidates = [];
+
+  function updateRoomSummary() {
+    const room = roomInput.value.trim();
+    const base = resolveBase(baseInput);
+    roomSummary.textContent = room
+      ? `Ready to subscribe to room "${room}" on ${base}.`
+      : "No room selected yet.";
+
+    if (currentView() === "subscribe") {
+      syncViewUrl("subscribe", { room, base });
+    }
+  }
 
   async function stop() {
     if (stopIcePolling) {
@@ -390,6 +536,9 @@ function wireSubscriber() {
     log.setStatus("Idle");
     setMediaState({ start: startButton, stop: stopButton }, false);
   }
+
+  roomInput.addEventListener("input", updateRoomSummary);
+  baseInput.addEventListener("input", updateRoomSummary);
 
   startButton.addEventListener("click", async () => {
     try {
@@ -504,6 +653,7 @@ function wireSubscriber() {
       stopIcePolling = startIcePolling(pc, resourceUrl, log);
       stopStatsPolling = startStatsPolling(pc, log, "subscriber");
       log.setStatus("Subscribed");
+      updateRoomSummary();
     } catch (error) {
       log.log("start failed", { error: error.message });
       await stop();
@@ -517,7 +667,10 @@ function wireSubscriber() {
   window.addEventListener("beforeunload", () => {
     stop();
   });
+
+  updateRoomSummary();
 }
 
+const navigation = wireNavigation();
 wirePublisher();
 wireSubscriber();
