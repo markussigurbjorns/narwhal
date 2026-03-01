@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Narwhal Browser Clients</title>
+    <style>
+      :root {
+        --bg: #f4efe6;
+        --panel: #fffaf2;
+        --ink: #182028;
+        --muted: #5e6a74;
+        --line: #d9ccb8;
+        --accent: #006d77;
+        --accent-2: #d97706;
+        --danger: #b42318;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(0, 109, 119, 0.14), transparent 28rem),
+          radial-gradient(circle at top right, rgba(217, 119, 6, 0.16), transparent 20rem),
+          var(--bg);
+      }
+
+      main {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      h1, h2 {
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        letter-spacing: 0.02em;
+      }
+
+      .intro {
+        margin-bottom: 24px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 20px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 18px;
+        box-shadow: 0 12px 36px rgba(24, 32, 40, 0.08);
+      }
+
+      label {
+        display: block;
+        margin-bottom: 12px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      input {
+        width: 100%;
+        margin-top: 6px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--ink);
+      }
+
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin: 14px 0;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 14px;
+        font: inherit;
+        cursor: pointer;
+        background: var(--accent);
+        color: #fff;
+      }
+
+      button.secondary {
+        background: var(--accent-2);
+      }
+
+      button.danger {
+        background: var(--danger);
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      video {
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #0f1720;
+        border-radius: 14px;
+        border: 1px solid #0000001a;
+      }
+
+      pre {
+        margin: 0;
+        min-height: 180px;
+        max-height: 260px;
+        overflow: auto;
+        padding: 12px;
+        border-radius: 12px;
+        background: #111827;
+        color: #d1fae5;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .meta {
+        margin: 8px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="intro">
+        <h1>Narwhal Browser Clients</h1>
+        <p>Use these to publish media with WHIP and subscribe with WHEP against the current Rust server.</p>
+        <p class="meta">Serve this page from the same server and open <code>/clients/</code>.</p>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>WHIP Publisher</h2>
+          <label>
+            Room
+            <input id="pub-room" value="test-room">
+          </label>
+          <label>
+            Base URL
+            <input id="pub-base" value="">
+          </label>
+          <div class="actions">
+            <button id="pub-start">Start Publish</button>
+            <button id="pub-stop" class="danger" disabled>Stop Publish</button>
+          </div>
+          <video id="local-video" autoplay playsinline muted></video>
+          <p class="meta" id="pub-status">Idle</p>
+          <pre id="pub-log"></pre>
+        </article>
+
+        <article class="panel">
+          <h2>WHEP Subscriber</h2>
+          <label>
+            Room
+            <input id="sub-room" value="test-room">
+          </label>
+          <label>
+            Base URL
+            <input id="sub-base" value="">
+          </label>
+          <div class="actions">
+            <button id="sub-start" class="secondary">Start Subscribe</button>
+            <button id="sub-stop" class="danger" disabled>Stop Subscribe</button>
+          </div>
+          <video id="remote-video" autoplay playsinline controls muted></video>
+          <p class="meta" id="sub-status">Idle</p>
+          <pre id="sub-log"></pre>
+        </article>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

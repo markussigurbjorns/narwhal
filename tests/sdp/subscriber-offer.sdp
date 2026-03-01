@@ -1,0 +1,17 @@
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=Narwhal Subscriber
+t=0 0
+a=group:BUNDLE 0
+a=msid-semantic: WMS
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 0.0.0.0
+a=mid:0
+a=recvonly
+a=rtcp-mux
+a=ice-ufrag:testufrag
+a=ice-pwd:testpassword1234567890
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF
+a=setup:actpass
+a=rtpmap:111 opus/48000/2
+a=fmtp:111 minptime=10;useinbandfec=1

@@ -12,3 +12,4 @@ tracing-subscriber = "0.3.22"
 media = { path = "../../crates/media" }
 narwhal-core = { path = "../../crates/narwhal-core" }
 server = { path = "../../crates/server" }
+tracing = "0.1.44"

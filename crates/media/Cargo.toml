@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.101"
+bytes = "1.11.1"
 glib = "0.22.0"
-gstreamer = "0.25.0"
-gstreamer-sdp = "0.25.0"
-gstreamer-webrtc = "0.25.0"
+gstreamer = { version = "0.25.0", features = ["v1_16"] }
+gstreamer-app = { version = "0.25.0", features = ["v1_16"] }
+gstreamer-sdp = { version = "0.25.0", features = ["v1_16"] }
+gstreamer-webrtc = { version = "0.25.0", features = ["v1_16"] }
 parking_lot = "0.12.5"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"

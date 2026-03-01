@@ -14,8 +14,7 @@
 //
 use anyhow::Result;
 use glib::object::Cast;
-use glib::{ControlFlow, object::ObjectExt};
-use gstreamer::bus::BusWatchGuard;
+use glib::{ControlFlow, Priority, SourceId, object::ObjectExt};
 use gstreamer::prelude::GstObjectExt;
 use gstreamer::{
     self as gst,
@@ -70,7 +69,7 @@ pub struct PeerSession {
 #[derive(Default)]
 struct PeerHandlers {
     ice_handler: Option<glib::SignalHandlerId>,
-    bus_watch: Option<BusWatchGuard>,
+    bus_watch: Option<SourceId>,
 }
 
 struct PeerInner {
@@ -89,6 +88,8 @@ struct PeerInner {
     ice_tx: broadcast::Sender<IceCandidate>,
 
     handlers: Arc<RwLock<PeerHandlers>>,
+    whep_streams: Arc<RwLock<Vec<crate::RtpStreamInfo>>>,
+    whep_injector: Arc<RwLock<Option<crate::RtpInjector>>>,
 }
 
 impl PeerSession {
@@ -114,8 +115,31 @@ impl PeerSession {
                     .build()
                     .map_err(|_| anyhow::anyhow!("Failed to create webrtcbin (plugin missing?)"))?;
 
-                // IMPORTANT: don't ignore set_property result
-                webrtcbin.set_property("bundle-policy", &"max-bundle");
+                webrtcbin.set_property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle);
+
+                match role {
+                    PeerRole::WhipPublisher => {
+                        add_transceiver(
+                            &webrtcbin,
+                            gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly,
+                        );
+                        add_transceiver(
+                            &webrtcbin,
+                            gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly,
+                        );
+                    }
+                    PeerRole::WhepSubscriber => {}
+                    PeerRole::MeetingParticipant => {
+                        add_transceiver(
+                            &webrtcbin,
+                            gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+                        );
+                        add_transceiver(
+                            &webrtcbin,
+                            gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+                        );
+                    }
+                }
 
                 pipeline.add(&webrtcbin)?;
                 Ok((pipeline, webrtcbin))
@@ -133,6 +157,8 @@ impl PeerSession {
                 events,
                 ice_tx,
                 handlers: Arc::new(RwLock::new(PeerHandlers::default())),
+                whep_streams: Arc::new(RwLock::new(Vec::new())),
+                whep_injector: Arc::new(RwLock::new(None)),
             }),
         };
 
@@ -149,13 +175,103 @@ impl PeerSession {
         self.inner.role
     }
 
-    /// Start the peer pipeline (PLAYING). You can do this before or after negotiate;
-    /// most people do it immediately after creating the answer.
+    /// Move the peer pipeline to READY so negotiation can proceed.
     pub async fn start(&self) -> Result<()> {
         let pipeline = self.inner.pipeline.clone();
         self.gst
             .exec(move || {
-                pipeline.set_state(gst::State::Playing)?;
+                if let Err(err) = pipeline.set_state(gst::State::Ready) {
+                    let (state_res, current, pending) =
+                        pipeline.state(gst::ClockTime::from_mseconds(100));
+
+                    let bus_detail = pipeline.bus().and_then(|bus| {
+                        bus.pop_filtered(&[
+                            gst::MessageType::Error,
+                            gst::MessageType::Warning,
+                            gst::MessageType::StateChanged,
+                        ])
+                        .map(|msg| match msg.view() {
+                            gst::MessageView::Error(e) => format!(
+                                "error from {}: {} debug={:?}",
+                                e.src()
+                                    .map(|s| s.path_string())
+                                    .unwrap_or_else(|| "<unknown>".into()),
+                                e.error(),
+                                e.debug()
+                            ),
+                            gst::MessageView::Warning(w) => format!(
+                                "warning from {}: {} debug={:?}",
+                                w.src()
+                                    .map(|s| s.path_string())
+                                    .unwrap_or_else(|| "<unknown>".into()),
+                                w.error(),
+                                w.debug()
+                            ),
+                            gst::MessageView::StateChanged(s) => format!(
+                                "state-changed {:?}->{:?} pending {:?}",
+                                s.old(),
+                                s.current(),
+                                s.pending()
+                            ),
+                            _ => "other-message".to_string(),
+                        })
+                    });
+
+                    return Err(anyhow::anyhow!(
+                        "failed to set pipeline to READY: {err}; state_result={state_res:?}; current={current:?}; pending={pending:?}; bus={bus_detail:?}"
+                    ));
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Move the peer pipeline to PLAYING once negotiation and wiring are complete.
+    pub async fn play(&self) -> Result<()> {
+        let pipeline = self.inner.pipeline.clone();
+        self.gst
+            .exec(move || {
+                if let Err(err) = pipeline.set_state(gst::State::Playing) {
+                    let (state_res, current, pending) =
+                        pipeline.state(gst::ClockTime::from_mseconds(100));
+
+                    let bus_detail = pipeline.bus().and_then(|bus| {
+                        bus.pop_filtered(&[
+                            gst::MessageType::Error,
+                            gst::MessageType::Warning,
+                            gst::MessageType::StateChanged,
+                        ])
+                        .map(|msg| match msg.view() {
+                            gst::MessageView::Error(e) => format!(
+                                "error from {}: {} debug={:?}",
+                                e.src()
+                                    .map(|s| s.path_string())
+                                    .unwrap_or_else(|| "<unknown>".into()),
+                                e.error(),
+                                e.debug()
+                            ),
+                            gst::MessageView::Warning(w) => format!(
+                                "warning from {}: {} debug={:?}",
+                                w.src()
+                                    .map(|s| s.path_string())
+                                    .unwrap_or_else(|| "<unknown>".into()),
+                                w.error(),
+                                w.debug()
+                            ),
+                            gst::MessageView::StateChanged(s) => format!(
+                                "state-changed {:?}->{:?} pending {:?}",
+                                s.old(),
+                                s.current(),
+                                s.pending()
+                            ),
+                            _ => "other-message".to_string(),
+                        })
+                    });
+
+                    return Err(anyhow::anyhow!(
+                        "failed to set pipeline to PLAYING: {err}; state_result={state_res:?}; current={current:?}; pending={pending:?}; bus={bus_detail:?}"
+                    ));
+                }
                 Ok(())
             })
             .await
@@ -175,7 +291,7 @@ impl PeerSession {
                 }
 
                 if let Some(bus_watch) = h.bus_watch.take() {
-                    drop(bus_watch);
+                    bus_watch.remove();
                 }
 
                 pipeline.set_state(gst::State::Null)?;
@@ -200,6 +316,14 @@ impl PeerSession {
         self.inner.ice_tx.subscribe()
     }
 
+    pub fn set_whep_streams(&self, streams: Vec<crate::RtpStreamInfo>) {
+        *self.inner.whep_streams.write() = streams;
+    }
+
+    pub fn take_whep_injector(&self) -> Option<crate::RtpInjector> {
+        self.inner.whep_injector.write().take()
+    }
+
     /// Trickle ICE candidate from client -> server.
     pub async fn add_ice_candidate(&self, mline_index: u32, candidate: String) -> Result<()> {
         let webrtcbin = self.inner.webrtcbin.clone();
@@ -219,9 +343,13 @@ impl PeerSession {
     /// Returns the SDP answer text.
     pub async fn negotiate_as_answerer(&self, offer_sdp: String) -> Result<String> {
         let webrtcbin = self.inner.webrtcbin.clone();
+        let pipeline = self.inner.pipeline.clone();
         let peer_id = self.inner.peer_id.clone();
+        let role = self.inner.role;
         let local_sdp_store = self.inner.local_sdp.clone();
         let events = self.inner.events.clone();
+        let whep_streams = self.inner.whep_streams.clone();
+        let whep_injector = self.inner.whep_injector.clone();
 
         let (tx, rx) = oneshot::channel::<Result<String>>();
 
@@ -232,66 +360,159 @@ impl PeerSession {
                 }
 
                 let offer = parse_offer_sdp(&offer_sdp)?;
-
-                webrtcbin
-                    .emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
-
-                let webrtcbin_for_promise = webrtcbin.clone();
-                let peer_id_for_promise = peer_id.clone();
-                let events_for_promise = events.clone();
-                let local_sdp_store_for_promise = local_sdp_store.clone();
+                let webrtcbin_for_remote = webrtcbin.clone();
+                let pipeline_for_remote = pipeline.clone();
+                let peer_id_for_remote = peer_id.clone();
+                let role_for_remote = role;
+                let events_for_remote = events.clone();
+                let local_sdp_store_for_remote = local_sdp_store.clone();
+                let whep_streams_for_remote = whep_streams.clone();
+                let whep_injector_for_remote = whep_injector.clone();
 
                 let mut tx = Some(tx);
 
-                let promise = gst::Promise::with_change_func(move |reply| {
+                let set_remote_promise = gst::Promise::with_change_func(move |reply| {
                     let Some(tx) = tx.take() else {
                         return;
                     };
 
-                    let Ok(Some(reply)) = reply else {
-                        let _ = tx.send(Err(anyhow::anyhow!("create-answer promise got no reply")));
-                        if let Some(ev) = &events_for_promise {
-                            ev.on_state(&peer_id_for_promise, PeerState::Failed);
-                        }
-                        return;
-                    };
-
-                    let answer = match reply.get::<gst_webrtc::WebRTCSessionDescription>("answer") {
-                        Ok(a) => a,
-                        Err(e) => {
+                    match reply {
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(err) => {
                             let _ = tx.send(Err(anyhow::anyhow!(
-                                "create-answer reply missing/invalid 'answer': {e}"
+                                "set-remote-description promise failed: {err:?}"
                             )));
-                            if let Some(ev) = &events_for_promise {
-                                ev.on_state(&peer_id_for_promise, PeerState::Failed);
+                            if let Some(ev) = &events_for_remote {
+                                ev.on_state(&peer_id_for_remote, PeerState::Failed);
                             }
                             return;
                         }
-                    };
+                    }
 
-                    webrtcbin_for_promise.emit_by_name::<()>(
-                        "set-local-description",
-                        &[&answer, &None::<gst::Promise>],
-                    );
-
-                    match sdp_to_string(answer.sdp()) {
-                        Ok(txt) => {
-                            *local_sdp_store_for_promise.write() = Some(txt.clone());
-                            if let Some(ev) = &events_for_promise {
-                                ev.on_state(&peer_id_for_promise, PeerState::Connected);
-                            }
-                            let _ = tx.send(Ok(txt));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            if let Some(ev) = &events_for_promise {
-                                ev.on_state(&peer_id_for_promise, PeerState::Failed);
+                    if matches!(role_for_remote, PeerRole::WhepSubscriber) {
+                        set_all_transceivers_direction(
+                            &webrtcbin_for_remote,
+                            gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
+                        );
+                        let streams = whep_streams_for_remote.read().clone();
+                        if !streams.is_empty() {
+                            match crate::install_rtp_injector(
+                                &pipeline_for_remote,
+                                &webrtcbin_for_remote,
+                                streams,
+                            ) {
+                                Ok(injector) => {
+                                    *whep_injector_for_remote.write() = Some(injector);
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(Err(anyhow::anyhow!(
+                                        "failed to install whep injector during negotiation: {err}"
+                                    )));
+                                    if let Some(ev) = &events_for_remote {
+                                        ev.on_state(&peer_id_for_remote, PeerState::Failed);
+                                    }
+                                    return;
+                                }
                             }
                         }
                     }
+
+                    let webrtcbin_for_answer = webrtcbin_for_remote.clone();
+                    let peer_id_for_answer = peer_id_for_remote.clone();
+                    let role_for_answer = role_for_remote;
+                    let events_for_answer = events_for_remote.clone();
+                    let local_sdp_store_for_answer = local_sdp_store_for_remote.clone();
+
+                    let mut tx = Some(tx);
+
+                    let create_answer_promise = gst::Promise::with_change_func(move |reply| {
+                        let Some(tx) = tx.take() else {
+                            return;
+                        };
+
+                        let Ok(Some(reply)) = reply else {
+                            let _ = tx.send(Err(anyhow::anyhow!(
+                                "create-answer promise got no reply"
+                            )));
+                            if let Some(ev) = &events_for_answer {
+                                ev.on_state(&peer_id_for_answer, PeerState::Failed);
+                            }
+                            return;
+                        };
+
+                        let reply_debug = format!("{reply:?}");
+                        if let Ok(err) = reply.get::<glib::Error>("error") {
+                            let _ = tx.send(Err(anyhow::anyhow!(
+                                "create-answer failed: {err}; reply={reply_debug}"
+                            )));
+                            if let Some(ev) = &events_for_answer {
+                                ev.on_state(&peer_id_for_answer, PeerState::Failed);
+                            }
+                            return;
+                        }
+
+                        let answer = match reply.get::<gst_webrtc::WebRTCSessionDescription>("answer")
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                let _ = tx.send(Err(anyhow::anyhow!(
+                                    "create-answer reply missing/invalid 'answer': {e}; reply={reply_debug}"
+                                )));
+                                if let Some(ev) = &events_for_answer {
+                                    ev.on_state(&peer_id_for_answer, PeerState::Failed);
+                                }
+                                return;
+                            }
+                        };
+
+                        webrtcbin_for_answer.emit_by_name::<()>(
+                            "set-local-description",
+                            &[&answer, &None::<gst::Promise>],
+                        );
+
+                        match sdp_to_string(answer.sdp()) {
+                            Ok(txt) => {
+                                if matches!(role_for_answer, PeerRole::WhepSubscriber) {
+                                    let transceivers = describe_transceivers(&webrtcbin_for_answer);
+                                    let inactive = inactive_media_sections(&txt);
+                                    if !inactive.is_empty() {
+                                        let _ = tx.send(Err(anyhow::anyhow!(
+                                            "whep answer negotiated inactive media sections {:?}; transceivers={:?}; sdp={}",
+                                            inactive,
+                                            transceivers,
+                                            txt
+                                        )));
+                                        if let Some(ev) = &events_for_answer {
+                                            ev.on_state(&peer_id_for_answer, PeerState::Failed);
+                                        }
+                                        return;
+                                    }
+                                }
+                                *local_sdp_store_for_answer.write() = Some(txt.clone());
+                                if let Some(ev) = &events_for_answer {
+                                    ev.on_state(&peer_id_for_answer, PeerState::Connected);
+                                }
+                                let _ = tx.send(Ok(txt));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                if let Some(ev) = &events_for_answer {
+                                    ev.on_state(&peer_id_for_answer, PeerState::Failed);
+                                }
+                            }
+                        }
+                    });
+
+                    webrtcbin_for_remote.emit_by_name::<()>(
+                        "create-answer",
+                        &[&None::<gst::Structure>, &create_answer_promise],
+                    );
                 });
 
-                webrtcbin.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
+                webrtcbin.emit_by_name::<()>(
+                    "set-remote-description",
+                    &[&offer, &set_remote_promise],
+                );
                 Ok(())
             })
             .await?;
@@ -359,7 +580,7 @@ impl PeerSession {
                     .ok_or_else(|| anyhow::anyhow!("pipeline has no bus"))?;
 
                 // add_watch_local requires we're on a GLib thread/context (we are).
-                let guard = bus.add_watch_local(move |_, msg| {
+                let watch = bus.create_watch(None, Priority::DEFAULT, move |_, msg| {
                     use gst::MessageView;
 
                     match msg.view() {
@@ -409,11 +630,29 @@ impl PeerSession {
                         }
                         _ => ControlFlow::Continue,
                     }
-                })?;
+                });
 
-                handlers.write().bus_watch = Some(guard);
+                handlers.write().bus_watch = Some(watch.attach(None));
                 Ok(())
             })
+            .await
+    }
+    pub async fn install_rtp_tap(&self) -> Result<crate::RtpTap> {
+        let pipeline = self.inner.pipeline.clone();
+        let webrtcbin = self.inner.webrtcbin.clone();
+        self.gst
+            .exec(move || crate::install_rtp_tap(&pipeline, &webrtcbin))
+            .await
+    }
+
+    pub async fn install_rtp_injector(
+        &self,
+        initial_streams: Vec<crate::RtpStreamInfo>,
+    ) -> Result<crate::RtpInjector> {
+        let pipeline = self.inner.pipeline.clone();
+        let webrtcbin = self.inner.webrtcbin.clone();
+        self.gst
+            .exec(move || crate::install_rtp_injector(&pipeline, &webrtcbin, initial_streams))
             .await
     }
 }
@@ -430,4 +669,80 @@ fn parse_offer_sdp(sdp_txt: &str) -> Result<gst_webrtc::WebRTCSessionDescription
 
 fn sdp_to_string(msg: &gst_sdp::SDPMessageRef) -> Result<String> {
     Ok(msg.as_text()?.to_string())
+}
+
+fn add_transceiver(
+    webrtcbin: &gst::Element,
+    direction: gst_webrtc::WebRTCRTPTransceiverDirection,
+) {
+    let _ = webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+        "add-transceiver",
+        &[&direction, &None::<gst::Caps>],
+    );
+}
+
+fn describe_transceivers(webrtcbin: &gst::Element) -> Vec<String> {
+    let mut out = Vec::new();
+    for idx in 0..8i32 {
+        let transceiver =
+            webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+                "get-transceiver",
+                &[&idx],
+            );
+        let Some(transceiver) = transceiver else {
+            break;
+        };
+        out.push(format!(
+            "idx={idx} mline={} dir={:?} sender={} receiver={}",
+            transceiver.mlineindex(),
+            transceiver
+                .property_value("direction")
+                .get::<gst_webrtc::WebRTCRTPTransceiverDirection>()
+                .ok(),
+            transceiver.sender().is_some(),
+            transceiver.receiver().is_some(),
+        ));
+    }
+    out
+}
+
+fn set_all_transceivers_direction(
+    webrtcbin: &gst::Element,
+    direction: gst_webrtc::WebRTCRTPTransceiverDirection,
+) {
+    for idx in 0..8i32 {
+        let transceiver =
+            webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+                "get-transceiver",
+                &[&idx],
+            );
+        let Some(transceiver) = transceiver else {
+            break;
+        };
+        transceiver.set_property("direction", direction);
+    }
+}
+
+fn inactive_media_sections(sdp: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current_m = None::<String>;
+    let mut current_mid = None::<String>;
+
+    for line in sdp.lines() {
+        if let Some(rest) = line.strip_prefix("m=") {
+            current_m = Some(rest.to_string());
+            current_mid = None;
+        } else if let Some(rest) = line.strip_prefix("a=mid:") {
+            current_mid = Some(rest.to_string());
+        } else if line == "a=inactive" {
+            out.push(
+                current_mid
+                    .clone()
+                    .or_else(|| current_m.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            );
+        }
+    }
+
+    out
 }
