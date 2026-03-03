@@ -669,6 +669,7 @@ dependencies = [
  "media",
  "parking_lot",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

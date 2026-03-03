@@ -1,9 +1,10 @@
 use crate::BroadcastRouter;
 use crate::{IceQueue, PublisherSession, SubscriberSession, start_ice_collector};
 use anyhow::Result;
-use media::{GstRuntime, PeerRole, PeerSession};
+use media::{GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState};
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Handle;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +31,26 @@ struct RoomState {
     router: BroadcastRouter,
 }
 
+struct RoomPeerEvents {
+    rooms: RoomManager,
+    room: RoomId,
+    tokio_handle: Handle,
+}
+
+impl PeerEvents for RoomPeerEvents {
+    fn on_state(&self, _peer_id: &String, _state: PeerState) {}
+
+    fn on_keyframe_request(&self, _peer_id: &String) {
+        let rooms = self.rooms.clone();
+        let room = self.room.clone();
+        self.tokio_handle.spawn(async move {
+            if let Err(err) = rooms.request_publisher_keyframe(room).await {
+                tracing::warn!("failed to service subscriber keyframe request: {err:#}");
+            }
+        });
+    }
+}
+
 impl RoomManager {
     pub fn new(gst: GstRuntime) -> Self {
         Self {
@@ -49,6 +70,23 @@ impl RoomManager {
                 subscribers: HashMap::new(),
                 router: BroadcastRouter::new(),
             })
+    }
+
+    async fn request_publisher_keyframe(&self, room: RoomId) -> Result<()> {
+        let publisher = {
+            let g = self.inner.read();
+            let rs = g
+                .rooms
+                .get(&room)
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            rs.publisher
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no publisher"))?
+                .peer
+                .clone()
+        };
+
+        publisher.request_keyframe().await
     }
 
     /// POST /whip/:room  (offer SDP -> answer SDP)
@@ -219,7 +257,11 @@ impl RoomManager {
             self.gst.clone(),
             sub_id.clone(),
             PeerRole::WhepSubscriber,
-            None,
+            Some(Arc::new(RoomPeerEvents {
+                rooms: self.clone(),
+                room: room.clone(),
+                tokio_handle: Handle::current(),
+            })),
         )
         .await?;
 

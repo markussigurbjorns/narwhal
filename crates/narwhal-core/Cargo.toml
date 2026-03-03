@@ -8,5 +8,6 @@ anyhow = "1.0.102"
 parking_lot = "0.12.5"
 tokio = { version = "1.49.0", features = ["sync", "rt", "macros", "time"] }
 uuid = { version = "1.21.0", features = ["v4"] }
+tracing = "0.1.44"
 
 media = { path = "../media" }

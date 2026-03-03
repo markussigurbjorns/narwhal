@@ -18,7 +18,7 @@ use glib::{ControlFlow, Priority, SourceId, object::ObjectExt};
 use gstreamer::prelude::GstObjectExt;
 use gstreamer::{
     self as gst,
-    prelude::{ElementExt, GstBinExt},
+    prelude::{ElementExt, ElementExtManual, GstBinExt, PadExt, PadExtManual},
 };
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
@@ -49,6 +49,7 @@ pub struct IceCandidate {
 pub trait PeerEvents: Send + Sync + 'static {
     fn on_ice_candidate(&self, _peer_id: &PeerId, _cand: IceCandidate) {}
     fn on_state(&self, _peer_id: &PeerId, _state: PeerState) {}
+    fn on_keyframe_request(&self, _peer_id: &PeerId) {}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -335,6 +336,31 @@ impl PeerSession {
             .await
     }
 
+    pub async fn request_keyframe(&self) -> Result<()> {
+        let webrtcbin = self.inner.webrtcbin.clone();
+        self.gst
+            .exec(move || {
+                let video_pad = find_video_src_pad(&webrtcbin)
+                    .ok_or_else(|| anyhow::anyhow!("publisher video pad not available"))?;
+                let event = gst::event::CustomUpstream::new(
+                    gst::Structure::builder("GstForceKeyUnit")
+                        .field("running-time", gst::ClockTime::NONE)
+                        .field("all-headers", true)
+                        .field("count", 0u32)
+                        .build(),
+                );
+
+                if video_pad.send_event(event) {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "publisher video pad rejected upstream force-key-unit event"
+                    ))
+                }
+            })
+            .await
+    }
+
     /// Negotiate in "answerer" mode:
     /// - set remote offer
     /// - create answer
@@ -350,6 +376,8 @@ impl PeerSession {
         let events = self.inner.events.clone();
         let whep_streams = self.inner.whep_streams.clone();
         let whep_injector = self.inner.whep_injector.clone();
+        let keyframe_events = self.inner.events.clone();
+        let keyframe_peer_id = self.inner.peer_id.clone();
 
         let (tx, rx) = oneshot::channel::<Result<String>>();
 
@@ -396,10 +424,20 @@ impl PeerSession {
                         );
                         let streams = whep_streams_for_remote.read().clone();
                         if !streams.is_empty() {
+                            let on_video_keyframe_request = keyframe_events.clone().map(|events| {
+                                let peer_id = keyframe_peer_id.clone();
+                                Arc::new(move || {
+                                    tracing::info!(
+                                        "[{peer_id}] subscriber requested a video keyframe"
+                                    );
+                                    events.on_keyframe_request(&peer_id);
+                                }) as Arc<dyn Fn() + Send + Sync>
+                            });
                             match crate::install_rtp_injector(
                                 &pipeline_for_remote,
                                 &webrtcbin_for_remote,
                                 streams,
+                                on_video_keyframe_request,
                             ) {
                                 Ok(injector) => {
                                     *whep_injector_for_remote.write() = Some(injector);
@@ -652,7 +690,9 @@ impl PeerSession {
         let pipeline = self.inner.pipeline.clone();
         let webrtcbin = self.inner.webrtcbin.clone();
         self.gst
-            .exec(move || crate::install_rtp_injector(&pipeline, &webrtcbin, initial_streams))
+            .exec(move || {
+                crate::install_rtp_injector(&pipeline, &webrtcbin, initial_streams, None)
+            })
             .await
     }
 }
@@ -736,4 +776,27 @@ fn inactive_media_sections(sdp: &str) -> Vec<String> {
     }
 
     out
+}
+
+fn find_video_src_pad(webrtcbin: &gst::Element) -> Option<gst::Pad> {
+    webrtcbin.src_pads().into_iter().find(|pad| {
+        pad.current_caps()
+            .as_ref()
+            .is_some_and(is_video_rtp_caps)
+            || pad
+                .allowed_caps()
+                .as_ref()
+                .is_some_and(is_video_rtp_caps)
+    })
+}
+
+fn is_video_rtp_caps(caps: &gst::Caps) -> bool {
+    caps.structure(0).is_some_and(|s| {
+        s.name() == "application/x-rtp"
+            && s.get_optional::<String>("media")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("video")
+    })
 }

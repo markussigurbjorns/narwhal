@@ -3,3 +3,10 @@ NARWHAL TO DO:
   1. Tune the buffer sizes based on actual bitrate and latency targets.
   2. Add counters or metrics for dropped RTP so overload is visible in production.
   3. Decide whether slow subscribers should keep dropping packets or be disconnected after sustained overflow.
+
+1. Relay keyframe feedback only: detect subscriber-side PLI/FIR and trigger a publisher-side keyframe request.
+  2. Add observability first: inspect what feedback webrtcbin/stats expose so we know what to translate.
+  3. Go lower-level: integrate with rtpbin/transceiver hooks instead of pad-level RTP copying.
+
+
+IF a new publisher starts, then we dont know where to send the kayframes

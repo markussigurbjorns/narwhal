@@ -9,6 +9,8 @@ use tracing::warn;
 
 const RTP_TAP_BUFFER: usize = 256;
 const RTP_INJECTOR_BUFFER: usize = 256;
+//const RTP_TAP_BUFFER: usize = 10;
+//const RTP_INJECTOR_BUFFER: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct RtpPacket {
@@ -135,6 +137,7 @@ pub fn install_rtp_injector(
     pipeline: &gst::Pipeline,
     webrtcbin: &gst::Element,
     mut initial_streams: Vec<RtpStreamInfo>,
+    on_video_keyframe_request: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<RtpInjector> {
     let (tx, mut rx) = mpsc::channel::<RtpPacket>(RTP_INJECTOR_BUFFER);
 
@@ -149,7 +152,7 @@ pub fn install_rtp_injector(
     >::new()));
     let map2 = map.clone();
 
-    let make_src =
+    let make_src = move
         |pipeline: &gst::Pipeline, webrtcbin: &gst::Element, name: &str| -> gst_app::AppSrc {
             let appsrc_el = gst::ElementFactory::make("appsrc")
                 .name(&format!("rtp_in.{name}"))
@@ -176,6 +179,19 @@ pub fn install_rtp_injector(
                 .request_pad_simple(requested_pad)
                 .expect("failed to request webrtcbin sink pad");
             let srcpad = appsrc.static_pad("src").unwrap();
+            if name == "video" {
+                if let Some(on_video_keyframe_request) = on_video_keyframe_request.clone() {
+                    srcpad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                        if info
+                            .event()
+                            .is_some_and(|event| event.has_name("GstForceKeyUnit"))
+                        {
+                            on_video_keyframe_request();
+                        }
+                        gst::PadProbeReturn::Ok
+                    });
+                }
+            }
             let _ = srcpad.link(&sinkpad);
 
             appsrc
