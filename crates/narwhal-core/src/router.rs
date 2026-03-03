@@ -1,7 +1,7 @@
 use media::{RtpPacket, RtpStreamInfo, stream_info};
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 #[derive(Clone)]
 pub struct BroadcastRouter {
@@ -9,7 +9,7 @@ pub struct BroadcastRouter {
 }
 
 struct Inner {
-    subs: HashMap<String, mpsc::UnboundedSender<RtpPacket>>,
+    subs: HashMap<String, mpsc::Sender<RtpPacket>>,
     streams: HashMap<String, RtpStreamInfo>,
 }
 
@@ -23,12 +23,21 @@ impl BroadcastRouter {
         }
     }
 
-    pub fn add_sub(&self, sub_id: String, tx: mpsc::UnboundedSender<RtpPacket>) {
+    pub fn add_sub(&self, sub_id: String, tx: mpsc::Sender<RtpPacket>) {
         self.inner.write().subs.insert(sub_id, tx);
     }
 
     pub fn remove_sub(&self, sub_id: &str) {
         self.inner.write().subs.remove(sub_id);
+    }
+
+    pub fn subscriber_entries(&self) -> Vec<(String, mpsc::Sender<RtpPacket>)> {
+        self.inner
+            .read()
+            .subs
+            .iter()
+            .map(|(sub_id, tx)| (sub_id.clone(), tx.clone()))
+            .collect()
     }
 
     pub fn fanout(&self, pkt: RtpPacket) {
@@ -39,9 +48,26 @@ impl BroadcastRouter {
                 .insert(info.media_key.clone(), info);
         }
 
-        let g = self.inner.read();
-        for tx in g.subs.values() {
-            let _ = tx.send(pkt.clone());
+        let mut stale = Vec::new();
+
+        {
+            let g = self.inner.read();
+            for (sub_id, tx) in &g.subs {
+                match tx.try_send(pkt.clone()) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        // Drop overflowing RTP instead of letting a slow subscriber grow memory without bound.
+                    }
+                    Err(TrySendError::Closed(_)) => stale.push(sub_id.clone()),
+                }
+            }
+        }
+
+        if !stale.is_empty() {
+            let mut g = self.inner.write();
+            for sub_id in stale {
+                g.subs.remove(&sub_id);
+            }
         }
     }
 

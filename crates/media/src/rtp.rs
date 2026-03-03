@@ -4,7 +4,11 @@ use gstreamer::prelude::*;
 use gstreamer::{self as gst};
 use gstreamer_app as gst_app;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
+use tracing::warn;
+
+const RTP_TAP_BUFFER: usize = 256;
+const RTP_INJECTOR_BUFFER: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct RtpPacket {
@@ -23,15 +27,15 @@ pub struct RtpStreamInfo {
 }
 
 pub struct RtpTap {
-    pub rx: mpsc::UnboundedReceiver<RtpPacket>,
+    pub rx: mpsc::Receiver<RtpPacket>,
 }
 
 pub struct RtpInjector {
-    pub tx: mpsc::UnboundedSender<RtpPacket>,
+    pub tx: mpsc::Sender<RtpPacket>,
 }
 
 impl RtpInjector {
-    pub fn sender(&self) -> mpsc::UnboundedSender<RtpPacket> {
+    pub fn sender(&self) -> mpsc::Sender<RtpPacket> {
         self.tx.clone()
     }
 }
@@ -39,7 +43,7 @@ impl RtpInjector {
 /// Install an RTP tap: whenever webrtcbin adds a src_%u pad (application/x-rtp)
 /// we link it to an appsink and forward buffers to a tokio channel.
 pub fn install_rtp_tap(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Result<RtpTap> {
-    let (tx, rx) = mpsc::unbounded_channel::<RtpPacket>();
+    let (tx, rx) = mpsc::channel::<RtpPacket>(RTP_TAP_BUFFER);
     let pipeline_weak = pipeline.downgrade();
     let tx = Arc::new(tx);
 
@@ -109,7 +113,13 @@ pub fn install_rtp_tap(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Re
                         duration: buffer.duration(),
                     };
 
-                    let _ = tx2.send(pkt);
+                    match tx2.try_send(pkt) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            warn!("dropping RTP packet from tap because downstream queue is full");
+                        }
+                        Err(TrySendError::Closed(_)) => return Err(gst::FlowError::Eos),
+                    }
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -126,51 +136,50 @@ pub fn install_rtp_injector(
     webrtcbin: &gst::Element,
     mut initial_streams: Vec<RtpStreamInfo>,
 ) -> Result<RtpInjector> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<RtpPacket>();
+    let (tx, mut rx) = mpsc::channel::<RtpPacket>(RTP_INJECTOR_BUFFER);
 
     // We'll run a GLib task by using a bus idle or just rely on caller to call this on gst thread.
     // For now, assume called on gst thread and spawn a glib future:
     let pipeline_weak = pipeline.downgrade();
     let webrtcbin_weak = webrtcbin.downgrade();
 
-    let map = Arc::new(parking_lot::Mutex::new(
-        std::collections::HashMap::<String, gst_app::AppSrc>::new(),
-    ));
+    let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+        String,
+        gst_app::AppSrc,
+    >::new()));
     let map2 = map.clone();
 
-    let make_src = |pipeline: &gst::Pipeline,
-                    webrtcbin: &gst::Element,
-                    name: &str|
-     -> gst_app::AppSrc {
-        let appsrc_el = gst::ElementFactory::make("appsrc")
-            .name(&format!("rtp_in.{name}"))
-            .build()
-            .expect("appsrc create failed");
-        let appsrc = appsrc_el
-            .downcast::<gst_app::AppSrc>()
-            .expect("appsrc downcast failed");
-        appsrc.set_property("is-live", &true);
-        appsrc.set_property("format", &gst::Format::Time);
-        appsrc.set_property("do-timestamp", &false);
-        pipeline.add(appsrc.upcast_ref::<gst::Element>()).ok();
-        appsrc
-            .upcast_ref::<gst::Element>()
-            .sync_state_with_parent()
-            .ok();
+    let make_src =
+        |pipeline: &gst::Pipeline, webrtcbin: &gst::Element, name: &str| -> gst_app::AppSrc {
+            let appsrc_el = gst::ElementFactory::make("appsrc")
+                .name(&format!("rtp_in.{name}"))
+                .build()
+                .expect("appsrc create failed");
+            let appsrc = appsrc_el
+                .downcast::<gst_app::AppSrc>()
+                .expect("appsrc downcast failed");
+            appsrc.set_property("is-live", &true);
+            appsrc.set_property("format", &gst::Format::Time);
+            appsrc.set_property("do-timestamp", &false);
+            pipeline.add(appsrc.upcast_ref::<gst::Element>()).ok();
+            appsrc
+                .upcast_ref::<gst::Element>()
+                .sync_state_with_parent()
+                .ok();
 
-        let requested_pad = match name {
-            "audio" => "sink_0",
-            "video" => "sink_1",
-            _ => "sink_%u",
+            let requested_pad = match name {
+                "audio" => "sink_0",
+                "video" => "sink_1",
+                _ => "sink_%u",
+            };
+            let sinkpad = webrtcbin
+                .request_pad_simple(requested_pad)
+                .expect("failed to request webrtcbin sink pad");
+            let srcpad = appsrc.static_pad("src").unwrap();
+            let _ = srcpad.link(&sinkpad);
+
+            appsrc
         };
-        let sinkpad = webrtcbin
-            .request_pad_simple(requested_pad)
-            .expect("failed to request webrtcbin sink pad");
-        let srcpad = appsrc.static_pad("src").unwrap();
-        let _ = srcpad.link(&sinkpad);
-
-        appsrc
-    };
 
     initial_streams.sort_by_key(|stream| match stream.media_key.as_str() {
         "audio" => 0,

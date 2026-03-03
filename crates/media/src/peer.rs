@@ -671,10 +671,7 @@ fn sdp_to_string(msg: &gst_sdp::SDPMessageRef) -> Result<String> {
     Ok(msg.as_text()?.to_string())
 }
 
-fn add_transceiver(
-    webrtcbin: &gst::Element,
-    direction: gst_webrtc::WebRTCRTPTransceiverDirection,
-) {
+fn add_transceiver(webrtcbin: &gst::Element, direction: gst_webrtc::WebRTCRTPTransceiverDirection) {
     let _ = webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
         "add-transceiver",
         &[&direction, &None::<gst::Caps>],
@@ -684,11 +681,8 @@ fn add_transceiver(
 fn describe_transceivers(webrtcbin: &gst::Element) -> Vec<String> {
     let mut out = Vec::new();
     for idx in 0..8i32 {
-        let transceiver =
-            webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
-                "get-transceiver",
-                &[&idx],
-            );
+        let transceiver = webrtcbin
+            .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&idx]);
         let Some(transceiver) = transceiver else {
             break;
         };
@@ -711,11 +705,8 @@ fn set_all_transceivers_direction(
     direction: gst_webrtc::WebRTCRTPTransceiverDirection,
 ) {
     for idx in 0..8i32 {
-        let transceiver =
-            webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
-                "get-transceiver",
-                &[&idx],
-            );
+        let transceiver = webrtcbin
+            .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&idx]);
         let Some(transceiver) = transceiver else {
             break;
         };

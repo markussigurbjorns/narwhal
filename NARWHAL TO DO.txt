@@ -1,0 +1,5 @@
+NARWHAL TO DO:
+
+  1. Tune the buffer sizes based on actual bitrate and latency targets.
+  2. Add counters or metrics for dropped RTP so overload is visible in production.
+  3. Decide whether slow subscribers should keep dropping packets or be disconnected after sustained overflow.

@@ -69,13 +69,32 @@ impl RoomManager {
         // Install RTP tap (audio + video will appear as src_%u pads)
         let tap = peer.install_rtp_tap().await?;
         peer.play().await?;
+        let ice = IceQueue::new();
+        start_ice_collector(peer.ice_subscribe(), ice.clone());
 
-        // Get (or create) the room router now, then spawn a task to fanout
-        let router = {
+        let (router, old_publisher) = {
             let mut g = self.inner.write();
             let rs = Self::room_mut(&mut g, &room);
-            rs.router.clone()
+
+            let router = BroadcastRouter::new();
+            for (sub_id, tx) in rs.router.subscriber_entries() {
+                router.add_sub(sub_id, tx);
+            }
+
+            let old_publisher = rs.publisher.take();
+            rs.router = router.clone();
+            // v1 policy: replace existing publisher
+            rs.publisher = Some(PublisherSession {
+                id: pub_id.clone(),
+                peer,
+                ice,
+            });
+            (router, old_publisher)
         };
+
+        if let Some(old_publisher) = old_publisher {
+            old_publisher.peer.stop().await?;
+        }
 
         tokio::spawn(async move {
             let mut rx = tap.rx;
@@ -83,19 +102,6 @@ impl RoomManager {
                 router.fanout(pkt);
             }
         });
-        let ice = IceQueue::new();
-        start_ice_collector(peer.ice_subscribe(), ice.clone());
-
-        {
-            let mut g = self.inner.write();
-            let rs = Self::room_mut(&mut g, &room);
-            // v1 policy: replace existing publisher
-            rs.publisher = Some(PublisherSession {
-                id: pub_id.clone(),
-                peer,
-                ice,
-            });
-        }
 
         Ok(SdpResponse {
             answer_sdp: answer,
