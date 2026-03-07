@@ -453,6 +453,13 @@ impl PeerSession {
                                 }
                             }
                         }
+                    } else if matches!(role_for_remote, PeerRole::MeetingParticipant) {
+                        // Meeting peers both send local media and receive subscribed remote media.
+                        // Keep directions explicit so answer SDP doesn't collapse to recvonly.
+                        set_all_transceivers_direction(
+                            &webrtcbin_for_remote,
+                            gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+                        );
                     }
 
                     let webrtcbin_for_answer = webrtcbin_for_remote.clone();

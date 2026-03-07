@@ -1,10 +1,12 @@
+mod ws;
+
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +20,7 @@ pub fn app(rooms: RoomManager) -> Router {
         .route("/whep/{room}", post(whep_post))
         .route("/whep/{room}/{sub}/ice", get(whep_get_ice))
         .route("/whep/{room}/{sub}", delete(whep_delete).patch(whep_patch))
+        .route("/ws", get(ws::ws_upgrade))
         .with_state(rooms)
 }
 

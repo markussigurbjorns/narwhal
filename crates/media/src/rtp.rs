@@ -172,15 +172,39 @@ pub fn install_rtp_injector(
                 .sync_state_with_parent()
                 .ok();
 
-            let requested_pad = match name {
-                "audio" => "sink_0",
-                "video" => "sink_1",
-                _ => "sink_%u",
+            let preferred_pad = match name {
+                "audio" => Some("sink_0"),
+                "video" => Some("sink_1"),
+                _ => None,
             };
-            let sinkpad = webrtcbin
-                .request_pad_simple(requested_pad)
-                .expect("failed to request webrtcbin sink pad");
-            let srcpad = appsrc.static_pad("src").unwrap();
+            let sinkpad = preferred_pad
+                .and_then(|pad_name| find_unlinked_pad_by_name(webrtcbin, pad_name))
+                .or_else(|| {
+                    preferred_pad.and_then(|pad_name| {
+                        // Avoid requesting a named sink pad that already exists.
+                        // GStreamer warns that behavior is undefined in that case.
+                        if find_any_pad_by_name(webrtcbin, pad_name).is_none() {
+                            webrtcbin.request_pad_simple(pad_name)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .or_else(|| webrtcbin.request_pad_simple("sink_%u"));
+            let Some(sinkpad) = sinkpad else {
+                warn!(
+                    media_key = %name,
+                    "failed to request webrtcbin sink pad; dropping stream injection for this key"
+                );
+                return appsrc;
+            };
+            let Some(srcpad) = appsrc.static_pad("src") else {
+                warn!(
+                    media_key = %name,
+                    "appsrc has no static src pad; dropping stream injection for this key"
+                );
+                return appsrc;
+            };
             if name == "video" {
                 if let Some(on_video_keyframe_request) = on_video_keyframe_request.clone() {
                     srcpad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
@@ -194,7 +218,24 @@ pub fn install_rtp_injector(
                     });
                 }
             }
-            let _ = srcpad.link(&sinkpad);
+            if srcpad.link(&sinkpad).is_err() {
+                // Some layouts expose sink_0/sink_1 but they are already occupied or otherwise unusable.
+                // Retry with a newly requested sink_%u before giving up.
+                let retry_sink = webrtcbin.request_pad_simple("sink_%u");
+                if let Some(retry_sink) = retry_sink {
+                    if srcpad.link(&retry_sink).is_err() {
+                        warn!(
+                            media_key = %name,
+                            "failed to link appsrc to webrtcbin sink pad; dropping stream injection for this key"
+                        );
+                    }
+                } else {
+                    warn!(
+                        media_key = %name,
+                        "failed to link appsrc to webrtcbin sink pad; dropping stream injection for this key"
+                    );
+                }
+            }
 
             appsrc
         };
@@ -261,6 +302,20 @@ fn media_key(pkt: &RtpPacket) -> Option<String> {
     } else {
         None
     }
+}
+
+fn find_unlinked_pad_by_name(webrtcbin: &gst::Element, name: &str) -> Option<gst::Pad> {
+    webrtcbin
+        .pads()
+        .into_iter()
+        .find(|pad| pad.name().as_str() == name && !pad.is_linked())
+}
+
+fn find_any_pad_by_name(webrtcbin: &gst::Element, name: &str) -> Option<gst::Pad> {
+    webrtcbin
+        .pads()
+        .into_iter()
+        .find(|pad| pad.name().as_str() == name)
 }
 
 pub fn stream_info(pkt: &RtpPacket) -> Option<RtpStreamInfo> {

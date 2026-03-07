@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Narwhal Meeting Demo</title>
+    <style>
+      :root {
+        --bg: #ecf2f8;
+        --panel: #fdfefe;
+        --ink: #132238;
+        --muted: #57687e;
+        --line: #c8d5e2;
+        --accent: #0f5c8f;
+        --accent-2: #0b8f6d;
+        --danger: #b42318;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at 10% 10%, rgba(11, 143, 109, 0.15), transparent 22rem),
+          radial-gradient(circle at 90% 0%, rgba(15, 92, 143, 0.18), transparent 20rem),
+          var(--bg);
+      }
+
+      main {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      .hero h1 {
+        margin: 0 0 6px;
+        font-family: "IBM Plex Mono", monospace;
+      }
+
+      .hero p {
+        margin: 0 0 16px;
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 360px minmax(0, 1fr);
+      }
+
+      .stack {
+        display: grid;
+        gap: 14px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 14px;
+        box-shadow: 0 10px 28px rgba(19, 34, 56, 0.08);
+      }
+
+      label {
+        display: block;
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+
+      input {
+        width: 100%;
+        margin-top: 6px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 10px;
+        font: inherit;
+      }
+
+      .actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 12px 0 6px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 9px 13px;
+        font: inherit;
+        cursor: pointer;
+        background: var(--accent);
+        color: white;
+      }
+
+      button.secondary { background: var(--accent-2); }
+      button.danger { background: var(--danger); }
+
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+      .status {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      pre {
+        margin: 8px 0 0;
+        min-height: 220px;
+        max-height: 380px;
+        overflow: auto;
+        border-radius: 10px;
+        padding: 10px;
+        background: #0e1727;
+        color: #d2f8e9;
+        font-size: 12px;
+      }
+
+      .videos {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      }
+
+      .lists h3 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .lists ul {
+        margin: 6px 0 10px;
+        padding-left: 18px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .tile {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        overflow: hidden;
+        background: #0b1220;
+      }
+
+      .tile header {
+        background: #0f1d34;
+        color: #eaf1fb;
+        font-size: 12px;
+        padding: 6px 8px;
+      }
+
+      video {
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #04070d;
+        object-fit: contain;
+      }
+
+      @media (max-width: 900px) {
+        .grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <h1>Meeting Mode Demo</h1>
+        <p>Join a room, publish local camera+mic, auto-subscribe to other participants, and renegotiate over JSON-RPC/WebSocket.</p>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <label>
+            Room
+            <input id="room" value="meeting-room">
+          </label>
+          <label>
+            Display Name
+            <input id="display-name" value="">
+          </label>
+          <label>
+            WS URL
+            <input id="ws-url" value="">
+          </label>
+          <div class="actions">
+            <button id="connect">Connect</button>
+            <button id="renegotiate" class="secondary" disabled>Renegotiate</button>
+            <button id="leave" class="danger" disabled>Leave</button>
+          </div>
+          <p class="status" id="status">Idle</p>
+          <pre id="log"></pre>
+        </article>
+
+        <section class="stack">
+          <article class="panel">
+            <div class="videos" id="videos">
+              <section class="tile">
+                <header>Local</header>
+                <video id="local-video" autoplay playsinline muted></video>
+              </section>
+            </div>
+          </article>
+          <article class="panel lists">
+            <h3>Participants</h3>
+            <ul id="participants-list"></ul>
+            <h3>Publications</h3>
+            <ul id="publications-list"></ul>
+            <h3>My Subscriptions</h3>
+            <ul id="subscriptions-list"></ul>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="/clients/meeting.js"></script>
+  </body>
+</html>

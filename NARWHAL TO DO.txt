@@ -16,3 +16,13 @@ IF a new publisher starts, then we dont know where to send the kayframes
   3. Check for dropping RTP ... queue is full. If present, raise queue sizes or drop slow subscribers earlier.
   4. If keyframe delay is the issue, send periodic FIR/PLI for first 2-3 seconds after subscribe (until first video keyframe seen).
   5. Add one integration test scenario: subscribe while publisher is already running, assert first media arrival under a target SLA (for example < 1500 ms).
+
+MEETING MODE 
+Execution plan
+
+  1. Introduce room mode + meeting state structs (no behavior change yet).
+  2. Add WS + JSON-RPC plumbing.
+  3. Implement join/leave + ICE + sdp_offer.
+  4. Implement publish_tracks + subscribe/unsubscribe graph.
+  5. Wire renegotiation revisioning + serialization lock.
+  6. Add tests for race cases (simultaneous subscribe/unsubscribe, stale revision).
