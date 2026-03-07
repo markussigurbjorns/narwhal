@@ -163,7 +163,9 @@ pub fn install_rtp_injector(
                 .expect("appsrc downcast failed");
             appsrc.set_property("is-live", &true);
             appsrc.set_property("format", &gst::Format::Time);
-            appsrc.set_property("do-timestamp", &false);
+            // Use local pipeline time for forwarded RTP so a late-joining subscriber
+            // does not inherit the publisher pipeline running-time and stall playback.
+            appsrc.set_property("do-timestamp", &true);
             pipeline.add(appsrc.upcast_ref::<gst::Element>()).ok();
             appsrc
                 .upcast_ref::<gst::Element>()
@@ -228,6 +230,7 @@ pub fn install_rtp_injector(
                     src.clone()
                 } else {
                     let appsrc = make_src(&pipeline, &webrtcbin, &media_key);
+                    appsrc.set_caps(Some(&pkt.caps));
                     m.insert(media_key.clone(), appsrc.clone());
                     appsrc
                 }
@@ -236,9 +239,11 @@ pub fn install_rtp_injector(
             let mut buf = gst::Buffer::from_mut_slice(pkt.data.to_vec());
             {
                 let b = buf.get_mut().unwrap();
-                b.set_pts(pkt.pts);
-                b.set_dts(pkt.dts);
-                b.set_duration(pkt.duration);
+                // Let appsrc timestamp on push; forwarded RTP packet payload already
+                // carries RTP timestamps/seqnums from publisher.
+                b.set_pts(gst::ClockTime::NONE);
+                b.set_dts(gst::ClockTime::NONE);
+                b.set_duration(gst::ClockTime::NONE);
             }
             let _ = appsrc.push_buffer(buf);
         }
@@ -263,4 +268,106 @@ pub fn stream_info(pkt: &RtpPacket) -> Option<RtpStreamInfo> {
         media_key,
         caps: pkt.caps.clone(),
     })
+}
+
+pub fn is_probable_video_keyframe(pkt: &RtpPacket) -> bool {
+    if !pkt.caps.to_string().contains("media=(string)video") {
+        return false;
+    }
+
+    // v1: only inspect VP8 payloads; other codecs return false.
+    if !pkt.caps.to_string().contains("encoding-name=(string)VP8") {
+        return false;
+    }
+
+    let payload = match rtp_payload(&pkt.data) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    is_vp8_keyframe(payload)
+}
+
+fn rtp_payload(pkt: &[u8]) -> Option<&[u8]> {
+    if pkt.len() < 12 {
+        return None;
+    }
+    let v = pkt[0] >> 6;
+    if v != 2 {
+        return None;
+    }
+
+    let cc = (pkt[0] & 0x0f) as usize;
+    let has_ext = (pkt[0] & 0x10) != 0;
+    let mut off = 12usize.checked_add(cc.checked_mul(4)?)?;
+    if pkt.len() < off {
+        return None;
+    }
+
+    if has_ext {
+        if pkt.len() < off + 4 {
+            return None;
+        }
+        let ext_words = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) as usize;
+        off = off.checked_add(4usize.checked_add(ext_words.checked_mul(4)?)?)?;
+        if pkt.len() < off {
+            return None;
+        }
+    }
+
+    Some(&pkt[off..])
+}
+
+fn is_vp8_keyframe(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+
+    // RFC 7741 VP8 payload descriptor.
+    let b0 = payload[0];
+    let x = (b0 & 0x80) != 0;
+    let s = (b0 & 0x10) != 0;
+    let part_id = b0 & 0x0f;
+    let mut off = 1usize;
+
+    if x {
+        if payload.len() < off + 1 {
+            return false;
+        }
+        let ext = payload[off];
+        off += 1;
+
+        if (ext & 0x80) != 0 {
+            if payload.len() < off + 1 {
+                return false;
+            }
+            let m = (payload[off] & 0x80) != 0;
+            off += 1;
+            if m {
+                if payload.len() < off + 1 {
+                    return false;
+                }
+                off += 1;
+            }
+        }
+        if (ext & 0x40) != 0 {
+            if payload.len() < off + 1 {
+                return false;
+            }
+            off += 1;
+        }
+        if (ext & 0x20) != 0 || (ext & 0x10) != 0 {
+            if payload.len() < off + 1 {
+                return false;
+            }
+            off += 1;
+        }
+    }
+
+    if !s || part_id != 0 || payload.len() <= off {
+        return false;
+    }
+
+    // For VP8 payload header, frame type is bit0 (0 = keyframe, 1 = interframe).
+    (payload[off] & 0x01) == 0
 }

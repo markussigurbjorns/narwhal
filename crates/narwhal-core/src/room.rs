@@ -280,6 +280,12 @@ impl RoomManager {
             rs.router.add_sub(sub_id.clone(), injector.tx.clone());
         }
 
+        // Prompt a fresh keyframe as soon as a subscriber joins so startup
+        // doesn't depend on the publisher's natural GOP interval.
+        if let Err(err) = self.request_publisher_keyframe(room.clone()).await {
+            tracing::warn!("failed to request keyframe for new subscriber: {err:#}");
+        }
+
         let ice = IceQueue::new();
         start_ice_collector(peer.ice_subscribe(), ice.clone());
 

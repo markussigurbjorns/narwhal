@@ -10,3 +10,9 @@ NARWHAL TO DO:
 
 
 IF a new publisher starts, then we dont know where to send the kayframes
+
+• 1. Run a fresh publish+subscribe and capture server logs around subscribe time.
+  2. Check if join_to_first_rtp_ms is low but join_to_first_video_keyframe_ms is high. If yes, keyframe cadence/request path is the bottleneck.
+  3. Check for dropping RTP ... queue is full. If present, raise queue sizes or drop slow subscribers earlier.
+  4. If keyframe delay is the issue, send periodic FIR/PLI for first 2-3 seconds after subscribe (until first video keyframe seen).
+  5. Add one integration test scenario: subscribe while publisher is already running, assert first media arrival under a target SLA (for example < 1500 ms).
