@@ -23,7 +23,7 @@ use gstreamer::{
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::{env, sync::Arc};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::GstRuntime;
@@ -117,6 +117,7 @@ impl PeerSession {
                     .map_err(|_| anyhow::anyhow!("Failed to create webrtcbin (plugin missing?)"))?;
 
                 webrtcbin.set_property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle);
+                apply_webrtc_ice_config_from_env(&webrtcbin);
 
                 match role {
                     PeerRole::WhipPublisher => {
@@ -517,6 +518,12 @@ impl PeerSession {
 
                         match sdp_to_string(answer.sdp()) {
                             Ok(txt) => {
+                                let txt = if matches!(role_for_answer, PeerRole::MeetingParticipant)
+                                {
+                                    normalize_answer_setup_attr(txt)
+                                } else {
+                                    txt
+                                };
                                 if matches!(role_for_answer, PeerRole::WhepSubscriber) {
                                     let transceivers = describe_transceivers(&webrtcbin_for_answer);
                                     let inactive = inactive_media_sections(&txt);
@@ -704,6 +711,57 @@ impl PeerSession {
     }
 }
 
+fn normalize_answer_setup_attr(sdp: String) -> String {
+    // In renegotiation some stacks may emit actpass (or duplicate setup lines)
+    // in generated answer SDP. Browsers require answer setup to be active/passive
+    // and tolerate only one setup line per media section.
+    let normalized = sdp
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::with_capacity(normalized.len());
+    let mut in_media = false;
+    let mut saw_setup_in_media = false;
+
+    for mut line in normalized {
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("m=") {
+            in_media = true;
+            saw_setup_in_media = false;
+            out.push(line);
+            continue;
+        }
+
+        if line.starts_with("a=setup:") {
+            if in_media {
+                if saw_setup_in_media {
+                    continue;
+                }
+                if line == "a=setup:actpass" || line == "a=setup:holdconn" {
+                    line = "a=setup:active".to_string();
+                }
+                saw_setup_in_media = true;
+            } else if line == "a=setup:actpass" || line == "a=setup:holdconn" {
+                line = "a=setup:active".to_string();
+            }
+            out.push(line);
+            continue;
+        }
+
+        out.push(line);
+    }
+
+    let mut joined = out.join("\r\n");
+    joined.push_str("\r\n");
+    joined
+}
+
 fn parse_offer_sdp(sdp_txt: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {
     let msg = gst_sdp::SDPMessage::parse_buffer(sdp_txt.as_bytes())
         .map_err(|e| anyhow::anyhow!("SDP parse error: {e:?}"))?;
@@ -806,4 +864,20 @@ fn is_video_rtp_caps(caps: &gst::Caps) -> bool {
                 .as_deref()
                 == Some("video")
     })
+}
+
+fn apply_webrtc_ice_config_from_env(webrtcbin: &gst::Element) {
+    // GStreamer expects:
+    //   stun-server = "stun://host:port"
+    //   turn-server = "turn://user:pass@host:port?transport=udp"
+    if let Ok(stun) = env::var("NARWHAL_STUN_SERVER") {
+        if !stun.trim().is_empty() {
+            webrtcbin.set_property("stun-server", stun.trim());
+        }
+    }
+    if let Ok(turn) = env::var("NARWHAL_TURN_SERVER") {
+        if !turn.trim().is_empty() {
+            webrtcbin.set_property("turn-server", turn.trim());
+        }
+    }
 }

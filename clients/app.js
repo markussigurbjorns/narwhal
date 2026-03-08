@@ -1,4 +1,5 @@
 const defaultBase = `${window.location.protocol}//${window.location.host}`;
+const defaultStunUrl = "stun:turn.makudoku.com:3478";
 
 function createLogger(el, statusEl, prefix) {
   return {
@@ -49,6 +50,26 @@ function buildUrl(base, path) {
 
 function getSearchParams() {
   return new URLSearchParams(window.location.search);
+}
+
+function buildIceServers(params = getSearchParams()) {
+  const stun = params.get("stun") || defaultStunUrl;
+  const turnUrl = params.get("turn") || "turn:turn.makudoku.com:3478?transport=udp";
+  const turnUser = params.get("turn_user");
+  const turnPass = params.get("turn_pass");
+
+  const servers = [];
+  if (stun) {
+    servers.push({ urls: stun });
+  }
+  if (turnUser && turnPass) {
+    servers.push({
+      urls: [turnUrl],
+      username: turnUser,
+      credential: turnPass,
+    });
+  }
+  return servers;
 }
 
 function currentView(params = getSearchParams()) {
@@ -395,7 +416,7 @@ function wirePublisher() {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
       video.srcObject = stream;
 
-      pc = new RTCPeerConnection();
+      pc = new RTCPeerConnection({ iceServers: buildIceServers() });
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
       pc.addEventListener("connectionstatechange", () => {
@@ -546,7 +567,7 @@ function wireSubscriber() {
       log.setStatus("Creating recvonly peer");
       setMediaState({ start: startButton, stop: stopButton }, true);
 
-      pc = new RTCPeerConnection();
+      pc = new RTCPeerConnection({ iceServers: buildIceServers() });
       pc.addTransceiver("audio", { direction: "recvonly" });
       pc.addTransceiver("video", { direction: "recvonly" });
 

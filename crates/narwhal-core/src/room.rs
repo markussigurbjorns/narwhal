@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -270,12 +271,26 @@ impl RoomManager {
             .collect();
 
         let wanted = wanted?;
+        let mut new_video_publishers = HashSet::new();
         let subs = rs.meeting.subscriptions.entry(pid).or_default();
         for tid in wanted {
-            subs.insert(tid);
+            let is_new = subs.insert(tid.clone());
+            if is_new
+                && let Some(publication) = rs.meeting.publications.get(&tid)
+                && matches!(publication.media_kind, crate::MediaKind::Video)
+            {
+                new_video_publishers.insert(publication.publisher.0.clone());
+            }
         }
 
-        Ok(rs.meeting.next_revision())
+        let revision = rs.meeting.next_revision();
+        drop(g);
+
+        for publisher_id in new_video_publishers {
+            self.schedule_meeting_keyframe_warmup(room.clone(), publisher_id);
+        }
+
+        Ok(revision)
     }
 
     pub fn meeting_unsubscribe(
@@ -641,6 +656,53 @@ impl RoomManager {
                 }
             }
         }
+    }
+
+    fn schedule_meeting_keyframe_warmup(&self, room: RoomId, publisher_id: String) {
+        let rooms = self.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=3u8 {
+                if let Err(err) = rooms
+                    .request_meeting_participant_keyframe(room.clone(), &publisher_id)
+                    .await
+                {
+                    tracing::warn!(
+                        publisher_id = %publisher_id,
+                        attempt,
+                        "meeting keyframe warmup request failed: {err:#}"
+                    );
+                } else {
+                    tracing::info!(
+                        publisher_id = %publisher_id,
+                        attempt,
+                        "meeting keyframe warmup requested"
+                    );
+                }
+                sleep(Duration::from_millis(700)).await;
+            }
+        });
+    }
+
+    async fn request_meeting_participant_keyframe(
+        &self,
+        room: RoomId,
+        participant_id: &str,
+    ) -> Result<()> {
+        let peer = {
+            let g = self.inner.read();
+            let rs = g
+                .rooms
+                .get(&room)
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            Self::require_meeting_mode(rs)?;
+            rs.meeting_participants
+                .get(participant_id)
+                .ok_or_else(|| anyhow::anyhow!("meeting publisher session not found"))?
+                .peer
+                .clone()
+        };
+
+        peer.request_keyframe().await
     }
 
     async fn request_publisher_keyframe(&self, room: RoomId) -> Result<()> {

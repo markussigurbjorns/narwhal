@@ -26,3 +26,9 @@ Execution plan
   4. Implement publish_tracks + subscribe/unsubscribe graph.
   5. Wire renegotiation revisioning + serialization lock.
   6. Add tests for race cases (simultaneous subscribe/unsubscribe, stale revision).
+
+
+##### USE #####
+
+NARWHAL_STUN_SERVER='stun://turn.makudoku.com:3478' NARWHAL_TURN_SERVER='turn://testuser:testpassword@turn.makudoku.com:3478?transport=udp' cargo run -p narwhald
+http://localhost:8080/clients/meeting?turn_user=testuser&turn_pass=testpassword

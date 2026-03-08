@@ -1,4 +1,7 @@
 const defaultWsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`;
+const defaultStunUrl = "stun:turn.makudoku.com:3478";
+const urlParams = new URLSearchParams(window.location.search);
+const enableIceRecoveryRenegotiation = urlParams.get("ice_recovery") === "1";
 
 const el = {
   room: document.querySelector("#room"),
@@ -31,6 +34,11 @@ let pending = new Map();
 let drainTimer = null;
 let syncTimer = null;
 let renegotiating = false;
+let renegotiateRequested = false;
+let renegotiateReason = "queued";
+let renegotiateNeedsIceRestart = false;
+let recoveryTimer = null;
+let remoteCombinedStream = null;
 
 function setStatus(text) {
   el.status.textContent = text;
@@ -74,20 +82,41 @@ function drainPending(error) {
   }
 }
 
-function ensureRemoteTile(streamId) {
-  let section = document.querySelector(`[data-stream-id="${streamId}"]`);
+function ensureRemoteTile() {
+  let section = document.querySelector(`[data-stream-id="remote-main"]`);
   if (section) return section.querySelector("video");
   section = document.createElement("section");
   section.className = "tile";
-  section.dataset.streamId = streamId;
+  section.dataset.streamId = "remote-main";
   const header = document.createElement("header");
-  header.textContent = `Remote ${streamId.slice(0, 8)}`;
+  header.textContent = "Remote";
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
   section.append(header, video);
   el.videos.appendChild(section);
   return video;
+}
+
+function buildIceServers() {
+  const params = urlParams;
+  const stun = params.get("stun") || defaultStunUrl;
+  const turnUrl = params.get("turn") || "turn:turn.makudoku.com:3478?transport=udp";
+  const turnUser = params.get("turn_user");
+  const turnPass = params.get("turn_pass");
+
+  const servers = [];
+  if (stun) {
+    servers.push({ urls: stun });
+  }
+  if (turnUser && turnPass) {
+    servers.push({
+      urls: [turnUrl],
+      username: turnUser,
+      credential: turnPass,
+    });
+  }
+  return servers;
 }
 
 function renderSimpleList(ul, items) {
@@ -122,7 +151,12 @@ function renderMeetingLists(participants, publications, subscriptions) {
 }
 
 async function setupPeerConnection() {
-  pc = new RTCPeerConnection();
+  const iceServers = buildIceServers();
+  pc = new RTCPeerConnection({ iceServers });
+  log("ice servers configured", {
+    stun: iceServers.filter((s) => String(s.urls).startsWith("stun:")).length,
+    turn: iceServers.filter((s) => String(s.urls).startsWith("turn:")).length,
+  });
 
   pc.addEventListener("connectionstatechange", () => {
     setStatus(`Peer ${pc.connectionState}`);
@@ -131,6 +165,33 @@ async function setupPeerConnection() {
 
   pc.addEventListener("iceconnectionstatechange", () => {
     log("pc ice state", { state: pc.iceConnectionState });
+    if (
+      enableIceRecoveryRenegotiation &&
+      (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")
+    ) {
+      if (!recoveryTimer) {
+        recoveryTimer = window.setTimeout(() => {
+          recoveryTimer = null;
+          void renegotiate("ice recovery", { iceRestart: true });
+        }, 1500);
+      }
+    } else if (pc.iceConnectionState === "connected") {
+      if (recoveryTimer) {
+        window.clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+    }
+  });
+
+  pc.addEventListener("signalingstatechange", () => {
+    log("pc signaling state", { state: pc.signalingState });
+    if (pc.signalingState === "stable" && renegotiateRequested) {
+      const reason = renegotiateReason;
+      const iceRestart = renegotiateNeedsIceRestart;
+      renegotiateRequested = false;
+      renegotiateNeedsIceRestart = false;
+      void renegotiate(`${reason} (deferred)`, { iceRestart });
+    }
   });
 
   pc.addEventListener("icecandidate", async (event) => {
@@ -146,9 +207,18 @@ async function setupPeerConnection() {
   });
 
   pc.addEventListener("track", (event) => {
-    const stream = event.streams[0] || new MediaStream([event.track]);
-    const video = ensureRemoteTile(stream.id || event.track.id);
-    video.srcObject = stream;
+    if (!remoteCombinedStream) {
+      remoteCombinedStream = new MediaStream();
+    }
+    // Avoid duplicate track insertion on repeated track events.
+    const exists = remoteCombinedStream
+        .getTracks()
+        .some((t) => t.id === event.track.id);
+    if (!exists) {
+      remoteCombinedStream.addTrack(event.track);
+    }
+    const video = ensureRemoteTile();
+    video.srcObject = remoteCombinedStream;
     log("remote track", { kind: event.track.kind, id: event.track.id });
   });
 
@@ -159,25 +229,67 @@ async function setupPeerConnection() {
   }
 }
 
-async function renegotiate(reason) {
+async function renegotiate(reason, options = {}) {
+  const iceRestart = Boolean(options.iceRestart);
   if (!pc) return;
-  if (renegotiating) return;
+  if (renegotiating) {
+    renegotiateRequested = true;
+    renegotiateReason = reason;
+    renegotiateNeedsIceRestart = renegotiateNeedsIceRestart || iceRestart;
+    return;
+  }
+  if (pc.signalingState !== "stable") {
+    renegotiateRequested = true;
+    renegotiateReason = reason;
+    renegotiateNeedsIceRestart = renegotiateNeedsIceRestart || iceRestart;
+    log("renegotiate deferred (not stable)", { reason, state: pc.signalingState });
+    return;
+  }
   renegotiating = true;
   try {
-    const offer = await pc.createOffer();
+    const offer = await pc.createOffer({ iceRestart });
     await pc.setLocalDescription(offer);
     const res = await rpc("sdp_offer", {
       revision,
       offer_sdp: offer.sdp,
     });
     revision = res.revision;
+    log("remote answer summary", summarizeSdp(res.answer_sdp));
     await pc.setRemoteDescription({ type: "answer", sdp: res.answer_sdp });
-    log("renegotiated", { reason, revision });
+    log("renegotiated", { reason, revision, iceRestart });
   } catch (error) {
     log("renegotiate failed", { reason, error: error.message });
+    if (pc && pc.localDescription?.sdp) {
+      log("local offer summary (failed cycle)", summarizeSdp(pc.localDescription.sdp));
+    }
+    try {
+      if (pc.signalingState === "have-local-offer") {
+        await pc.setLocalDescription({ type: "rollback" });
+        log("rolled back local offer after failure");
+      }
+    } catch (rollbackError) {
+      log("rollback failed", { error: rollbackError.message });
+    }
+    renegotiateRequested = true;
+    renegotiateReason = reason;
+    renegotiateNeedsIceRestart = renegotiateNeedsIceRestart || iceRestart;
   } finally {
     renegotiating = false;
   }
+}
+
+function summarizeSdp(sdp) {
+  return (sdp || "")
+    .split(/\r?\n/)
+    .filter(
+      (line) =>
+        line.startsWith("m=") ||
+        line.startsWith("a=mid:") ||
+        line.startsWith("a=setup:") ||
+        line.startsWith("a=send") ||
+        line.startsWith("a=recv") ||
+        line.startsWith("a=rtpmap:")
+    );
 }
 
 async function syncSubscriptions() {
@@ -218,7 +330,15 @@ async function syncSubscriptions() {
       log("unsubscribe", { track_ids: toRemove, revision });
     }
     if (changed) {
-      await renegotiate("subscription update");
+      if (pc && pc.iceConnectionState !== "connected") {
+        renegotiateRequested = true;
+        renegotiateReason = "subscription update";
+        log("subscription renegotiation deferred (ice not connected)", {
+          iceState: pc ? pc.iceConnectionState : "unknown",
+        });
+      } else {
+        await renegotiate("subscription update");
+      }
     }
   } catch (error) {
     log("subscription sync failed", { error: error.message });
@@ -345,6 +465,7 @@ async function leave() {
   for (const tile of [...document.querySelectorAll(".tile[data-stream-id]")]) {
     tile.remove();
   }
+  remoteCombinedStream = null;
 
   try {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -374,7 +495,9 @@ el.connect.addEventListener("click", () => {
 });
 
 el.renegotiate.addEventListener("click", () => {
-  renegotiate("manual");
+  syncSubscriptions().catch((error) => {
+    log("sync now failed", { error: error.message });
+  });
 });
 
 el.leave.addEventListener("click", () => {
