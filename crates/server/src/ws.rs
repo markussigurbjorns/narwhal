@@ -412,7 +412,7 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": true
+        "needs_renegotiation": false
     }))
 }
 
@@ -432,7 +432,7 @@ async fn unpublish_tracks(state: &mut SessionState, params: Value) -> Result<Val
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": true
+        "needs_renegotiation": false
     }))
 }
 
@@ -452,7 +452,7 @@ async fn subscribe(state: &mut SessionState, params: Value) -> Result<Value, Rpc
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": true
+        "needs_renegotiation": false
     }))
 }
 
@@ -472,7 +472,7 @@ async fn unsubscribe(state: &mut SessionState, params: Value) -> Result<Value, R
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": true
+        "needs_renegotiation": false
     }))
 }
 

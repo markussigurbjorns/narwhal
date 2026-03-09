@@ -271,22 +271,25 @@ async function applySubscriptionSelection() {
   );
 
   let changed = false;
+  let needsRenegotiation = false;
   if (toAdd.length > 0) {
     const res = await rpc("subscribe", { track_ids: toAdd });
     revision = res.revision;
+    needsRenegotiation = needsRenegotiation || Boolean(res.needs_renegotiation);
     changed = true;
     log("subscribe", { publisher_id: selectedPublisherId, track_ids: toAdd, revision });
   }
   if (toRemove.length > 0) {
     const res = await rpc("unsubscribe", { track_ids: toRemove });
     revision = res.revision;
+    needsRenegotiation = needsRenegotiation || Boolean(res.needs_renegotiation);
     changed = true;
     log("unsubscribe", { publisher_id: selectedPublisherId, track_ids: toRemove, revision });
   }
 
   await syncSubscriptions();
 
-  if (!changed) return;
+  if (!changed || !needsRenegotiation) return;
   if (pc && pc.iceConnectionState !== "connected") {
     renegotiateRequested = true;
     renegotiateReason = "subscription update";
