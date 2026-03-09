@@ -150,11 +150,46 @@
         font-size: 14px;
       }
 
+      .lists h4 {
+        margin: 10px 0 6px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
       .lists ul {
         margin: 6px 0 10px;
         padding-left: 18px;
         color: var(--muted);
         font-size: 13px;
+      }
+
+      .track-picker {
+        display: grid;
+        gap: 8px;
+        margin: 8px 0 12px;
+      }
+
+      .track-picker label {
+        margin: 0;
+      }
+
+      .track-options {
+        display: grid;
+        gap: 6px;
+        margin: 6px 0 0;
+      }
+
+      .track-option {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+        color: var(--ink);
+      }
+
+      .track-option input {
+        width: auto;
+        margin: 0;
       }
 
       .tile {
@@ -187,7 +222,7 @@
     <main>
       <section class="hero">
         <h1>Meeting Mode Demo</h1>
-        <p>Join a room, publish local camera+mic, auto-subscribe to other participants, and renegotiate over JSON-RPC/WebSocket.</p>
+        <p>Join a room, publish local camera+mic, inspect live room state, and manually control remote subscriptions over JSON-RPC/WebSocket.</p>
       </section>
 
       <section class="grid">
@@ -235,6 +270,20 @@
             <ul id="participants-list"></ul>
             <h3>Publications</h3>
             <ul id="publications-list"></ul>
+            <h3>Subscription Control</h3>
+            <div class="track-picker">
+              <label>
+                Remote Publisher
+                <select id="publisher-select" disabled></select>
+              </label>
+              <div>
+                <h4>Selectable Tracks</h4>
+                <div id="track-options" class="track-options"></div>
+              </div>
+              <div class="actions">
+                <button id="apply-subscriptions" class="secondary" disabled>Apply Selection</button>
+              </div>
+            </div>
             <h3>Requested Subscriptions</h3>
             <ul id="requested-subscriptions-list"></ul>
             <h3>Effective Subscriptions</h3>

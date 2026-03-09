@@ -18,6 +18,9 @@ const el = {
   videos: document.querySelector("#videos"),
   participantsList: document.querySelector("#participants-list"),
   publicationsList: document.querySelector("#publications-list"),
+  publisherSelect: document.querySelector("#publisher-select"),
+  trackOptions: document.querySelector("#track-options"),
+  applySubscriptions: document.querySelector("#apply-subscriptions"),
   requestedSubscriptionsList: document.querySelector("#requested-subscriptions-list"),
   effectiveSubscriptionsList: document.querySelector("#effective-subscriptions-list"),
   streamsList: document.querySelector("#streams-list"),
@@ -44,6 +47,9 @@ let renegotiateNeedsIceRestart = false;
 let recoveryTimer = null;
 let remoteCombinedStream = null;
 let currentPolicyMode = null;
+let latestPublications = [];
+let latestRequestedTrackIds = [];
+let selectedPublisherId = null;
 
 function setStatus(text) {
   el.status.textContent = text;
@@ -61,6 +67,8 @@ function setButtons(connected) {
   el.leave.disabled = !connected;
   el.renegotiate.disabled = !connected;
   el.policyMode.disabled = !connected;
+  el.publisherSelect.disabled = !connected;
+  el.applySubscriptions.disabled = !connected;
 }
 
 function rpc(method, params = {}) {
@@ -172,6 +180,122 @@ function renderMeetingLists(participants, publications, requestedSubscriptions, 
       return bits.join(" • ");
     })
   );
+}
+
+function renderSubscriptionControls(participants, publications, requestedTrackIds) {
+  latestPublications = publications || [];
+  latestRequestedTrackIds = requestedTrackIds || [];
+
+  const remotePublishers = new Map();
+  for (const publication of latestPublications) {
+    if (publication.publisher_id === participantId) continue;
+    if (!remotePublishers.has(publication.publisher_id)) {
+      const participant = (participants || []).find(
+        (item) => item.participant_id === publication.publisher_id
+      );
+      remotePublishers.set(publication.publisher_id, {
+        participantId: publication.publisher_id,
+        displayName:
+          participant?.display_name || `participant ${publication.publisher_id.slice(0, 8)}`,
+      });
+    }
+  }
+
+  const publisherIds = [...remotePublishers.keys()].sort();
+  if (!selectedPublisherId || !remotePublishers.has(selectedPublisherId)) {
+    selectedPublisherId = publisherIds[0] || null;
+  }
+
+  el.publisherSelect.textContent = "";
+  if (publisherIds.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No remote publishers";
+    el.publisherSelect.appendChild(option);
+    el.publisherSelect.disabled = true;
+    el.applySubscriptions.disabled = true;
+  } else {
+    for (const publisherId of publisherIds) {
+      const option = document.createElement("option");
+      option.value = publisherId;
+      option.textContent = remotePublishers.get(publisherId).displayName;
+      if (publisherId === selectedPublisherId) {
+        option.selected = true;
+      }
+      el.publisherSelect.appendChild(option);
+    }
+    el.publisherSelect.disabled = false;
+    el.applySubscriptions.disabled = false;
+  }
+
+  const selectedTracks = latestPublications.filter(
+    (publication) => publication.publisher_id === selectedPublisherId
+  );
+  el.trackOptions.textContent = "";
+  if (selectedTracks.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "meta";
+    empty.textContent = "No remote tracks";
+    el.trackOptions.appendChild(empty);
+    return;
+  }
+
+  for (const publication of selectedTracks) {
+    const label = document.createElement("label");
+    label.className = "track-option";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = publication.track_id;
+    input.checked = latestRequestedTrackIds.includes(publication.track_id);
+    const text = document.createElement("span");
+    text.textContent = `${publication.media_kind} • ${publication.track_id}`;
+    label.append(input, text);
+    el.trackOptions.appendChild(label);
+  }
+}
+
+async function applySubscriptionSelection() {
+  if (!participantId || !selectedPublisherId) return;
+  const selectedTrackIds = [...el.trackOptions.querySelectorAll('input[type="checkbox"]:checked')]
+    .map((input) => input.value);
+  const publisherTrackIds = latestPublications
+    .filter((publication) => publication.publisher_id === selectedPublisherId)
+    .map((publication) => publication.track_id);
+
+  const current = new Set(latestRequestedTrackIds);
+  const wantedForPublisher = new Set(selectedTrackIds);
+
+  const toAdd = selectedTrackIds.filter((trackId) => !current.has(trackId));
+  const toRemove = publisherTrackIds.filter(
+    (trackId) => current.has(trackId) && !wantedForPublisher.has(trackId)
+  );
+
+  let changed = false;
+  if (toAdd.length > 0) {
+    const res = await rpc("subscribe", { track_ids: toAdd });
+    revision = res.revision;
+    changed = true;
+    log("subscribe", { publisher_id: selectedPublisherId, track_ids: toAdd, revision });
+  }
+  if (toRemove.length > 0) {
+    const res = await rpc("unsubscribe", { track_ids: toRemove });
+    revision = res.revision;
+    changed = true;
+    log("unsubscribe", { publisher_id: selectedPublisherId, track_ids: toRemove, revision });
+  }
+
+  await syncSubscriptions();
+
+  if (!changed) return;
+  if (pc && pc.iceConnectionState !== "connected") {
+    renegotiateRequested = true;
+    renegotiateReason = "subscription update";
+    log("subscription renegotiation deferred (ice not connected)", {
+      iceState: pc ? pc.iceConnectionState : "unknown",
+    });
+    return;
+  }
+  await renegotiate("subscription update");
 }
 
 function setPolicyMode(mode) {
@@ -350,47 +474,11 @@ async function syncSubscriptions() {
       subs.effective_track_ids || subs.track_ids || [],
       streams.streams || []
     );
-    const byPublisher = new Map();
-    for (const p of pubs.publications || []) {
-      if (p.publisher_id === participantId) continue;
-      const list = byPublisher.get(p.publisher_id) || [];
-      list.push(p);
-      byPublisher.set(p.publisher_id, list);
-    }
-    const selectedPublisher = [...byPublisher.keys()].sort()[0] || null;
-    const wanted = new Set(
-      selectedPublisher
-        ? (byPublisher.get(selectedPublisher) || []).map((p) => p.track_id)
-        : []
+    renderSubscriptionControls(
+      parts.participants,
+      pubs.publications || [],
+      subs.requested_track_ids || []
     );
-    const current = new Set(subs.requested_track_ids || []);
-    const toAdd = [...wanted].filter((id) => !current.has(id));
-    const toRemove = [...current].filter((id) => !wanted.has(id));
-
-    let changed = false;
-    if (toAdd.length > 0) {
-      const res = await rpc("subscribe", { track_ids: toAdd });
-      revision = res.revision;
-      changed = true;
-      log("subscribe", { publisher_id: selectedPublisher, track_ids: toAdd, revision });
-    }
-    if (toRemove.length > 0) {
-      const res = await rpc("unsubscribe", { track_ids: toRemove });
-      revision = res.revision;
-      changed = true;
-      log("unsubscribe", { track_ids: toRemove, revision });
-    }
-    if (changed) {
-      if (pc && pc.iceConnectionState !== "connected") {
-        renegotiateRequested = true;
-        renegotiateReason = "subscription update";
-        log("subscription renegotiation deferred (ice not connected)", {
-          iceState: pc ? pc.iceConnectionState : "unknown",
-        });
-      } else {
-        await renegotiate("subscription update");
-      }
-    }
   } catch (error) {
     log("subscription sync failed", { error: error.message });
   }
@@ -535,8 +623,12 @@ async function leave() {
   participantId = null;
   revision = null;
   currentPolicyMode = null;
+  latestPublications = [];
+  latestRequestedTrackIds = [];
+  selectedPublisherId = null;
   setPolicyMode(null);
   renderMeetingLists([], [], [], [], []);
+  renderSubscriptionControls([], [], []);
   setButtons(false);
   setStatus("Idle");
 }
@@ -551,6 +643,17 @@ el.connect.addEventListener("click", () => {
 el.renegotiate.addEventListener("click", () => {
   syncSubscriptions().catch((error) => {
     log("sync now failed", { error: error.message });
+  });
+});
+
+el.publisherSelect.addEventListener("change", () => {
+  selectedPublisherId = el.publisherSelect.value || null;
+  renderSubscriptionControls([], latestPublications, latestRequestedTrackIds);
+});
+
+el.applySubscriptions.addEventListener("click", () => {
+  applySubscriptionSelection().catch((error) => {
+    log("apply subscriptions failed", { error: error.message });
   });
 });
 
