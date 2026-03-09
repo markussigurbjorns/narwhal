@@ -742,6 +742,8 @@ name = "narwhal-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "gstreamer",
  "media",
  "parking_lot",
  "tokio",

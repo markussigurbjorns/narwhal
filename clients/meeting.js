@@ -10,13 +10,17 @@ const el = {
   connect: document.querySelector("#connect"),
   renegotiate: document.querySelector("#renegotiate"),
   leave: document.querySelector("#leave"),
+  policyMode: document.querySelector("#policy-mode"),
+  policyMeta: document.querySelector("#policy-meta"),
   status: document.querySelector("#status"),
   log: document.querySelector("#log"),
   localVideo: document.querySelector("#local-video"),
   videos: document.querySelector("#videos"),
   participantsList: document.querySelector("#participants-list"),
   publicationsList: document.querySelector("#publications-list"),
-  subscriptionsList: document.querySelector("#subscriptions-list"),
+  requestedSubscriptionsList: document.querySelector("#requested-subscriptions-list"),
+  effectiveSubscriptionsList: document.querySelector("#effective-subscriptions-list"),
+  streamsList: document.querySelector("#streams-list"),
 };
 
 el.wsUrl.value = defaultWsUrl;
@@ -39,6 +43,7 @@ let renegotiateReason = "queued";
 let renegotiateNeedsIceRestart = false;
 let recoveryTimer = null;
 let remoteCombinedStream = null;
+let currentPolicyMode = null;
 
 function setStatus(text) {
   el.status.textContent = text;
@@ -55,6 +60,7 @@ function setButtons(connected) {
   el.connect.disabled = connected;
   el.leave.disabled = !connected;
   el.renegotiate.disabled = !connected;
+  el.policyMode.disabled = !connected;
 }
 
 function rpc(method, params = {}) {
@@ -134,7 +140,7 @@ function renderSimpleList(ul, items) {
   }
 }
 
-function renderMeetingLists(participants, publications, subscriptions) {
+function renderMeetingLists(participants, publications, requestedSubscriptions, effectiveSubscriptions, streams) {
   renderSimpleList(
     el.participantsList,
     (participants || []).map(
@@ -147,7 +153,35 @@ function renderMeetingLists(participants, publications, subscriptions) {
       (p) => `${p.track_id} • ${p.media_kind} • ${p.publisher_id.slice(0, 8)}`
     )
   );
-  renderSimpleList(el.subscriptionsList, subscriptions || []);
+  renderSimpleList(el.requestedSubscriptionsList, requestedSubscriptions || []);
+  renderSimpleList(el.effectiveSubscriptionsList, effectiveSubscriptions || []);
+  renderSimpleList(
+    el.streamsList,
+    (streams || []).map((stream) => {
+      const bits = [
+        stream.track_id,
+        stream.media_kind,
+        stream.encoding_id,
+        `ssrc=${stream.ssrc}`,
+      ];
+      if (stream.mid) bits.push(`mid=${stream.mid}`);
+      if (stream.rid) bits.push(`rid=${stream.rid}`);
+      if (stream.spatial_layer !== null && stream.spatial_layer !== undefined) {
+        bits.push(`spatial=${stream.spatial_layer}`);
+      }
+      return bits.join(" • ");
+    })
+  );
+}
+
+function setPolicyMode(mode) {
+  currentPolicyMode = mode || null;
+  if (mode) {
+    el.policyMode.value = mode;
+    el.policyMeta.textContent = `Policy: ${mode}`;
+  } else {
+    el.policyMeta.textContent = "Policy: (not connected)";
+  }
 }
 
 async function setupPeerConnection() {
@@ -295,10 +329,27 @@ function summarizeSdp(sdp) {
 async function syncSubscriptions() {
   if (!participantId) return;
   try {
-    const parts = await rpc("list_participants", {});
-    const pubs = await rpc("list_publications", {});
-    const subs = await rpc("list_subscriptions", {});
-    renderMeetingLists(parts.participants, pubs.publications, subs.track_ids);
+    const [
+      parts,
+      pubs,
+      subs,
+      streams,
+      policy,
+    ] = await Promise.all([
+      rpc("list_participants", {}),
+      rpc("list_publications", {}),
+      rpc("list_subscriptions", {}),
+      rpc("list_streams", {}),
+      rpc("get_policy_mode", {}),
+    ]);
+    setPolicyMode(policy.mode);
+    renderMeetingLists(
+      parts.participants,
+      pubs.publications,
+      subs.requested_track_ids || [],
+      subs.effective_track_ids || subs.track_ids || [],
+      streams.streams || []
+    );
     const byPublisher = new Map();
     for (const p of pubs.publications || []) {
       if (p.publisher_id === participantId) continue;
@@ -312,7 +363,7 @@ async function syncSubscriptions() {
         ? (byPublisher.get(selectedPublisher) || []).map((p) => p.track_id)
         : []
     );
-    const current = new Set(subs.track_ids || []);
+    const current = new Set(subs.requested_track_ids || []);
     const toAdd = [...wanted].filter((id) => !current.has(id));
     const toRemove = [...current].filter((id) => !wanted.has(id));
 
@@ -418,6 +469,7 @@ async function connect() {
   participantId = joined.participant_id;
   revision = joined.revision;
   log("joined", joined);
+  setPolicyMode("standard");
 
   await setupPeerConnection();
 
@@ -482,7 +534,9 @@ async function leave() {
 
   participantId = null;
   revision = null;
-  renderMeetingLists([], [], []);
+  currentPolicyMode = null;
+  setPolicyMode(null);
+  renderMeetingLists([], [], [], [], []);
   setButtons(false);
   setStatus("Idle");
 }
@@ -502,6 +556,24 @@ el.renegotiate.addEventListener("click", () => {
 
 el.leave.addEventListener("click", () => {
   leave();
+});
+
+el.policyMode.addEventListener("change", () => {
+  if (!participantId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const mode = el.policyMode.value;
+  rpc("set_policy_mode", { mode })
+    .then(async (res) => {
+      revision = res.revision;
+      setPolicyMode(res.mode);
+      log("set_policy_mode", { mode: res.mode, revision });
+      await syncSubscriptions();
+    })
+    .catch((error) => {
+      log("set_policy_mode failed", { error: error.message });
+      if (currentPolicyMode) {
+        el.policyMode.value = currentPolicyMode;
+      }
+    });
 });
 
 window.addEventListener("beforeunload", () => {

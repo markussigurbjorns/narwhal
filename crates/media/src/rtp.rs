@@ -17,9 +17,18 @@ pub struct RtpPacket {
     pub pad_name: String,
     pub caps: gst::Caps,
     pub data: Bytes,
+    pub meta: RtpMeta,
     pub pts: Option<gst::ClockTime>,
     pub dts: Option<gst::ClockTime>,
     pub duration: Option<gst::ClockTime>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RtpMeta {
+    pub ssrc: Option<u32>,
+    pub sequence_number: Option<u16>,
+    pub timestamp: Option<u32>,
+    pub temporal_layer: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +119,7 @@ pub fn install_rtp_tap(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Re
                         pad_name: pad_name.clone(),
                         caps: caps2.clone(),
                         data: Bytes::copy_from_slice(map.as_slice()),
+                        meta: parse_rtp_meta(map.as_slice(), &caps2),
                         pts: buffer.pts(),
                         dts: buffer.dts(),
                         duration: buffer.duration(),
@@ -304,6 +314,48 @@ fn media_key(pkt: &RtpPacket) -> Option<String> {
     }
 }
 
+fn parse_rtp_meta(pkt: &[u8], caps: &gst::Caps) -> RtpMeta {
+    let Some(header) = parse_rtp_header(pkt) else {
+        return RtpMeta::default();
+    };
+
+    let temporal_layer = if caps.to_string().contains("encoding-name=(string)VP8") {
+        rtp_payload(pkt).and_then(vp8_temporal_layer)
+    } else {
+        None
+    };
+
+    RtpMeta {
+        ssrc: Some(header.ssrc),
+        sequence_number: Some(header.sequence_number),
+        timestamp: Some(header.timestamp),
+        temporal_layer,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RtpHeader {
+    sequence_number: u16,
+    timestamp: u32,
+    ssrc: u32,
+}
+
+fn parse_rtp_header(pkt: &[u8]) -> Option<RtpHeader> {
+    if pkt.len() < 12 {
+        return None;
+    }
+    let v = pkt[0] >> 6;
+    if v != 2 {
+        return None;
+    }
+
+    Some(RtpHeader {
+        sequence_number: u16::from_be_bytes([pkt[2], pkt[3]]),
+        timestamp: u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]),
+        ssrc: u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]),
+    })
+}
+
 fn find_unlinked_pad_by_name(webrtcbin: &gst::Element, name: &str) -> Option<gst::Pad> {
     webrtcbin
         .pads()
@@ -425,4 +477,93 @@ fn is_vp8_keyframe(payload: &[u8]) -> bool {
 
     // For VP8 payload header, frame type is bit0 (0 = keyframe, 1 = interframe).
     (payload[off] & 0x01) == 0
+}
+
+fn vp8_temporal_layer(payload: &[u8]) -> Option<u8> {
+    if payload.is_empty() {
+        return None;
+    }
+
+    let b0 = payload[0];
+    let x = (b0 & 0x80) != 0;
+    let mut off = 1usize;
+    if !x {
+        return None;
+    }
+    if payload.len() < off + 1 {
+        return None;
+    }
+
+    let ext = payload[off];
+    off += 1;
+
+    if (ext & 0x80) != 0 {
+        if payload.len() < off + 1 {
+            return None;
+        }
+        let m = (payload[off] & 0x80) != 0;
+        off += 1;
+        if m {
+            if payload.len() < off + 1 {
+                return None;
+            }
+            off += 1;
+        }
+    }
+    if (ext & 0x40) != 0 {
+        if payload.len() < off + 1 {
+            return None;
+        }
+        off += 1;
+    }
+
+    let has_tid = (ext & 0x20) != 0;
+    let has_keyidx = (ext & 0x10) != 0;
+    if !has_tid && !has_keyidx {
+        return None;
+    }
+    if payload.len() < off + 1 {
+        return None;
+    }
+
+    let tid_keyidx = payload[off];
+    if has_tid {
+        Some((tid_keyidx >> 6) & 0x03)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_rtp_header, vp8_temporal_layer};
+
+    #[test]
+    fn parses_basic_rtp_header() {
+        let pkt = [
+            0x80, 0x60, 0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let header = parse_rtp_header(&pkt).expect("valid header");
+        assert_eq!(header.sequence_number, 0x1234);
+        assert_eq!(header.timestamp, 0xaabbccdd);
+        assert_eq!(header.ssrc, 0x11223344);
+    }
+
+    #[test]
+    fn extracts_vp8_temporal_layer_from_extended_descriptor() {
+        let payload = [
+            0x90, // X=1, S=1
+            0x20, // T=1
+            0x80, // TID=2, Y=0, KEYIDX=0
+            0x00, // start of VP8 payload header
+        ];
+
+        assert_eq!(vp8_temporal_layer(&payload), Some(2));
+    }
+
+    #[test]
+    fn returns_none_when_vp8_temporal_layer_missing() {
+        let payload = [0x10, 0x00];
+        assert_eq!(vp8_temporal_layer(&payload), None);
+    }
 }

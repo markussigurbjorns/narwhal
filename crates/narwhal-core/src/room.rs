@@ -1,7 +1,10 @@
 use crate::BroadcastRouter;
 use crate::{
-    IceQueue, MeetingParticipantSession, MeetingRoomState, ParticipantId, ParticipantState,
-    PublisherSession, RoomMode, SubscriberSession, start_ice_collector,
+    ForwardingGraph, ForwardingKind, IceQueue, MeetingParticipantSession, MeetingPolicyMode,
+    MeetingRoomState, MidRoutingInfo, ParticipantId, ParticipantState, PublisherSession,
+    RoomFacts, RoomMode, SubscriberSession, SubscriptionPlan, VideoForwarding,
+    compile_forwarding_graph,
+    start_ice_collector,
 };
 use anyhow::Result;
 use media::{GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket};
@@ -43,6 +46,18 @@ pub struct MeetingParticipantInfo {
     pub display_name: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct MeetingStreamInfo {
+    pub track_id: String,
+    pub publisher_id: String,
+    pub media_kind: crate::MediaKind,
+    pub ssrc: u32,
+    pub encoding_id: String,
+    pub mid: Option<String>,
+    pub rid: Option<String>,
+    pub spatial_layer: Option<u8>,
+}
+
 #[derive(Clone)]
 pub struct RoomManager {
     gst: GstRuntime,
@@ -60,6 +75,9 @@ struct RoomState {
     meeting_participants: HashMap<String, MeetingParticipantSession>,
     router: BroadcastRouter,
     meeting: MeetingRoomState,
+    meeting_plan: SubscriptionPlan,
+    meeting_graph: ForwardingGraph,
+    meeting_streams: HashMap<crate::TrackId, HashMap<u32, MeetingStreamInfo>>,
     meeting_route_log_once: HashSet<String>,
 }
 
@@ -115,8 +133,44 @@ impl RoomManager {
                 meeting_participants: HashMap::new(),
                 router: BroadcastRouter::new(),
                 meeting: MeetingRoomState::new(room.clone()),
+                meeting_plan: SubscriptionPlan::default(),
+                meeting_graph: ForwardingGraph::default(),
+                meeting_streams: HashMap::new(),
                 meeting_route_log_once: HashSet::new(),
             })
+    }
+
+    fn recompute_meeting_plan(rs: &mut RoomState) {
+        rs.meeting_plan = crate::build_plan_for_mode(&RoomFacts::from_meeting_state(&rs.meeting));
+        rs.meeting_graph = compile_forwarding_graph(&rs.meeting_plan);
+        hydrate_meeting_graph(&mut rs.meeting_graph, &rs.meeting_streams);
+    }
+
+    pub fn meeting_policy_mode(&self, room: RoomId) -> Result<MeetingPolicyMode> {
+        let g = self.inner.read();
+        let rs = g
+            .rooms
+            .get(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_meeting_mode(rs)?;
+        Ok(rs.meeting.policy_mode)
+    }
+
+    pub fn meeting_set_policy_mode(
+        &self,
+        room: RoomId,
+        policy_mode: MeetingPolicyMode,
+    ) -> Result<u64> {
+        let mut g = self.inner.write();
+        let rs = g
+            .rooms
+            .get_mut(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_meeting_mode(rs)?;
+        rs.meeting.policy_mode = policy_mode;
+        let revision = rs.meeting.next_revision();
+        Self::recompute_meeting_plan(rs);
+        Ok(revision)
     }
 
     fn require_broadcast_mode(rs: &RoomState) -> Result<()> {
@@ -168,6 +222,7 @@ impl RoomManager {
                 display_name,
             });
         let rev = rs.meeting.next_revision();
+        Self::recompute_meeting_plan(rs);
         Ok(rev)
     }
 
@@ -202,7 +257,9 @@ impl RoomManager {
             );
         }
 
-        Ok(rs.meeting.next_revision())
+        let revision = rs.meeting.next_revision();
+        Self::recompute_meeting_plan(rs);
+        Ok(revision)
     }
 
     pub fn meeting_unpublish_tracks(
@@ -233,12 +290,15 @@ impl RoomManager {
                 }
             }
             rs.meeting.publications.remove(&tid);
-            for subs in rs.meeting.subscriptions.values_mut() {
+            rs.meeting_streams.remove(&tid);
+            for subs in rs.meeting.subscription_requests.values_mut() {
                 subs.remove(&tid);
             }
         }
 
-        Ok(rs.meeting.next_revision())
+        let revision = rs.meeting.next_revision();
+        Self::recompute_meeting_plan(rs);
+        Ok(revision)
     }
 
     pub fn meeting_subscribe(
@@ -272,7 +332,7 @@ impl RoomManager {
 
         let wanted = wanted?;
         let mut new_video_publishers = HashSet::new();
-        let subs = rs.meeting.subscriptions.entry(pid).or_default();
+        let subs = rs.meeting.subscription_requests.entry(pid).or_default();
         for tid in wanted {
             let is_new = subs.insert(tid.clone());
             if is_new
@@ -284,6 +344,7 @@ impl RoomManager {
         }
 
         let revision = rs.meeting.next_revision();
+        Self::recompute_meeting_plan(rs);
         drop(g);
 
         for publisher_id in new_video_publishers {
@@ -311,12 +372,14 @@ impl RoomManager {
             return Err(anyhow::anyhow!("participant not joined"));
         }
 
-        let subs = rs.meeting.subscriptions.entry(pid).or_default();
+        let subs = rs.meeting.subscription_requests.entry(pid).or_default();
         for raw_id in track_ids {
             subs.remove(&crate::TrackId(raw_id));
         }
 
-        Ok(rs.meeting.next_revision())
+        let revision = rs.meeting.next_revision();
+        Self::recompute_meeting_plan(rs);
+        Ok(revision)
     }
 
     pub fn meeting_list_publications(&self, room: RoomId) -> Result<Vec<MeetingPublicationInfo>> {
@@ -361,7 +424,7 @@ impl RoomManager {
         Ok(out)
     }
 
-    pub fn meeting_list_subscriptions(
+    pub fn meeting_list_subscription_requests(
         &self,
         room: RoomId,
         participant_id: &str,
@@ -380,11 +443,58 @@ impl RoomManager {
 
         let mut out = rs
             .meeting
-            .subscriptions
+            .subscription_requests
             .get(&pid)
             .map(|s| s.iter().map(|id| id.0.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         out.sort();
+        Ok(out)
+    }
+
+    pub fn meeting_list_effective_subscriptions(
+        &self,
+        room: RoomId,
+        participant_id: &str,
+    ) -> Result<Vec<String>> {
+        let g = self.inner.read();
+        let rs = g
+            .rooms
+            .get(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_meeting_mode(rs)?;
+
+        let pid = ParticipantId(participant_id.to_string());
+        if !rs.meeting.participants.contains_key(&pid) {
+            return Err(anyhow::anyhow!("participant not joined"));
+        }
+
+        Ok(rs
+            .meeting_plan
+            .effective_track_ids_for(&pid)
+            .into_iter()
+            .map(|id| id.0)
+            .collect())
+    }
+
+    pub fn meeting_list_streams(&self, room: RoomId) -> Result<Vec<MeetingStreamInfo>> {
+        let g = self.inner.read();
+        let rs = g
+            .rooms
+            .get(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_meeting_mode(rs)?;
+
+        let mut out = rs
+            .meeting_streams
+            .values()
+            .flat_map(|by_ssrc| by_ssrc.values().cloned())
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| {
+            a.track_id
+                .cmp(&b.track_id)
+                .then(a.ssrc.cmp(&b.ssrc))
+                .then(a.encoding_id.cmp(&b.encoding_id))
+        });
         Ok(out)
     }
 
@@ -398,10 +508,31 @@ impl RoomManager {
             Self::require_meeting_mode(rs)?;
 
             let pid = ParticipantId(participant_id.to_string());
+            let published_track_ids = rs
+                .meeting
+                .publications
+                .iter()
+                .filter_map(|(track_id, publication)| {
+                    if publication.publisher == pid {
+                        Some(track_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             rs.meeting.participants.remove(&pid);
-            rs.meeting.subscriptions.remove(&pid);
+            rs.meeting.subscription_requests.remove(&pid);
+            for subscriptions in rs.meeting.subscription_requests.values_mut() {
+                for track_id in &published_track_ids {
+                    subscriptions.remove(track_id);
+                }
+            }
             rs.meeting.publications.retain(|_, p| p.publisher != pid);
+            for track_id in &published_track_ids {
+                rs.meeting_streams.remove(track_id);
+            }
             rs.meeting.next_revision();
+            Self::recompute_meeting_plan(rs);
             rs.meeting_participants.remove(participant_id)
         };
 
@@ -476,7 +607,45 @@ impl RoomManager {
                     peer,
                     ice,
                     injector_tx: injector.tx.clone(),
+                    ssrc_to_mid: HashMap::new(),
+                    mid_routing: HashMap::new(),
                 });
+        }
+
+        let offer_ssrc_to_mid = parse_offer_ssrc_to_mid(&offer_sdp);
+        let offer_media_mids = parse_offer_media_mids(&offer_sdp);
+        let offer_mid_routing = parse_offer_mid_routing(&offer_sdp);
+
+        {
+            let mut g = self.inner.write();
+            let rs = g
+                .rooms
+                .get_mut(&room)
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            Self::require_meeting_mode(rs)?;
+
+            if let Some(session) = rs.meeting_participants.get_mut(participant_id) {
+                session.ssrc_to_mid = offer_ssrc_to_mid;
+                session.mid_routing = offer_mid_routing;
+            }
+
+            for (media_kind, mid) in offer_media_mids {
+                let mut matching_tracks = rs
+                    .meeting
+                    .publications
+                    .values_mut()
+                    .filter(|publication| {
+                        publication.publisher.0 == participant_id
+                            && publication.media_kind == media_kind
+                            && publication.mid.is_none()
+                    })
+                    .collect::<Vec<_>>();
+                if matching_tracks.len() == 1 {
+                    matching_tracks[0].mid = Some(mid);
+                }
+            }
+
+            Self::recompute_meeting_plan(rs);
         }
 
         let peer = {
@@ -567,17 +736,20 @@ impl RoomManager {
             }
 
             let publisher = ParticipantId(publisher_id.to_string());
-            let track_id = rs
-                .meeting
-                .publications
-                .iter()
-                .find_map(|(tid, p)| {
-                    if p.publisher == publisher && p.media_kind == kind {
-                        Some(tid.clone())
-                    } else {
-                        None
-                    }
-                });
+            let mapped_mid = pkt.meta.ssrc.and_then(|ssrc| {
+                rs.meeting_participants
+                    .get(publisher_id)
+                    .and_then(|session| session.ssrc_to_mid.get(&ssrc).cloned())
+            });
+            let track_id = rs.meeting.publications.iter().find_map(|(tid, p)| {
+                if p.publisher != publisher || p.media_kind != kind {
+                    return None;
+                }
+                if let Some(mid) = mapped_mid.as_ref() {
+                    return (p.mid.as_ref() == Some(mid)).then_some(tid.clone());
+                }
+                Some(tid.clone())
+            });
             let Some(track_id) = track_id else {
                 let key = format!("no-track:{publisher_id}:{kind:?}");
                 if rs.meeting_route_log_once.insert(key) {
@@ -590,17 +762,87 @@ impl RoomManager {
                 return;
             };
 
+            let rid = mapped_mid
+                .as_ref()
+                .and_then(|mid| {
+                    rs.meeting_participants
+                        .get(publisher_id)
+                        .and_then(|session| session.mid_routing.get(mid))
+                        .and_then(|routing| parse_rtp_rid(&pkt.data, routing.rid_ext_id?))
+                });
+            let packet_encoding_id = rid
+                .clone()
+                .or_else(|| pkt.meta.ssrc.map(|ssrc| format!("ssrc:{ssrc}")));
+
+            if let Some(ssrc) = pkt.meta.ssrc {
+                let publisher_id = publisher_id.to_string();
+                let media_kind = kind;
+                let track_id_for_log = track_id.0.clone();
+                let spatial_layer = mapped_mid.as_ref().and_then(|mid| {
+                    rs.meeting_participants
+                        .get(&publisher_id)
+                        .and_then(|session| session.mid_routing.get(mid))
+                        .and_then(|routing| {
+                            let rid = rid.as_ref()?;
+                            routing
+                                .send_rids
+                                .iter()
+                                .position(|candidate| candidate == rid)
+                                .map(|idx| idx as u8)
+                        })
+                });
+                let entry = rs.meeting_streams.entry(track_id.clone()).or_default();
+                entry.entry(ssrc).or_insert_with(|| {
+                    let encoding_id = rid
+                        .clone()
+                        .unwrap_or_else(|| format!("ssrc:{ssrc}"));
+                    tracing::info!(
+                        publisher_id = %publisher_id,
+                        track_id = %track_id_for_log,
+                        media_kind = ?media_kind,
+                        ssrc,
+                        encoding_id = %encoding_id,
+                        "observed meeting RTP stream"
+                    );
+                    MeetingStreamInfo {
+                        track_id: track_id_for_log,
+                        publisher_id,
+                        media_kind,
+                        ssrc,
+                        encoding_id,
+                        mid: mapped_mid.clone(),
+                        rid,
+                        spatial_layer,
+                    }
+                });
+                hydrate_meeting_graph(&mut rs.meeting_graph, &rs.meeting_streams);
+            }
+
             let targets = rs
-                .meeting
-                .subscriptions
+                .meeting_graph
+                .for_track(&track_id)
                 .iter()
-                .filter_map(|(participant, tracks)| {
-                    if !tracks.contains(&track_id) || participant.0 == publisher_id {
+                .filter_map(|forwarding| {
+                    if forwarding.subscriber_id.0 == publisher_id {
+                        return None;
+                    }
+                    let allowed = match (&forwarding.kind, kind) {
+                        (ForwardingKind::Audio, crate::MediaKind::Audio) => true,
+                        (ForwardingKind::Video(video), crate::MediaKind::Video) => {
+                            video_forwarding_allows_packet(
+                                &pkt,
+                                packet_encoding_id.as_deref(),
+                                video,
+                            )
+                        }
+                        _ => false,
+                    };
+                    if !allowed {
                         return None;
                     }
                     rs.meeting_participants
-                        .get(&participant.0)
-                        .map(|sess| (participant.0.clone(), sess.injector_tx.clone()))
+                        .get(&forwarding.subscriber_id.0)
+                        .map(|sess| (forwarding.subscriber_id.0.clone(), sess.injector_tx.clone()))
                 })
                 .collect::<Vec<_>>();
 
@@ -1027,4 +1269,479 @@ fn media_kind_from_packet(pkt: &RtpPacket) -> Option<crate::MediaKind> {
             "video" => Some(crate::MediaKind::Video),
             _ => None,
         })
+}
+
+fn video_forwarding_allows_packet(
+    _pkt: &RtpPacket,
+    packet_encoding_id: Option<&str>,
+    _video: &VideoForwarding,
+) -> bool {
+    if let Some(preferred_encoding_id) = _video.preferred_encoding_id.as_ref() {
+        if let Some(packet_encoding_id) = packet_encoding_id {
+            if packet_encoding_id != preferred_encoding_id {
+                return false;
+            }
+        }
+    }
+    let Some(max_temporal_layer) = _video.temporal_layer else {
+        return true;
+    };
+    let Some(packet_temporal_layer) = _pkt.meta.temporal_layer else {
+        // Packets without exposed temporal metadata still pass through for now.
+        return true;
+    };
+    packet_temporal_layer <= max_temporal_layer
+}
+
+fn hydrate_meeting_graph(
+    graph: &mut ForwardingGraph,
+    meeting_streams: &HashMap<crate::TrackId, HashMap<u32, MeetingStreamInfo>>,
+) {
+    for (track_id, forwardings) in &mut graph.track_subscribers {
+        let Some(streams_for_track) = meeting_streams.get(track_id) else {
+            continue;
+        };
+        for forwarding in forwardings {
+            if let ForwardingKind::Video(video) = &mut forwarding.kind {
+                video.preferred_encoding_id =
+                    select_preferred_encoding_id(video, streams_for_track);
+            }
+        }
+    }
+}
+
+fn select_preferred_encoding_id(
+    video: &VideoForwarding,
+    streams_for_track: &HashMap<u32, MeetingStreamInfo>,
+) -> Option<String> {
+    let mut candidates = streams_for_track.values().collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        a.spatial_layer
+            .unwrap_or(u8::MAX)
+            .cmp(&b.spatial_layer.unwrap_or(u8::MAX))
+            .then(a.encoding_id.cmp(&b.encoding_id))
+    });
+
+    let target_spatial = video.spatial_layer;
+    candidates
+        .iter()
+        .rev()
+        .find(|stream| match (stream.spatial_layer, target_spatial) {
+            (Some(layer), Some(target)) => layer <= target,
+            (Some(_), None) => true,
+            (None, _) => false,
+        })
+        .or_else(|| candidates.iter().find(|stream| stream.spatial_layer.is_none()))
+        .map(|stream| stream.encoding_id.clone())
+}
+
+fn parse_offer_ssrc_to_mid(sdp: &str) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    let mut current_mid = None::<String>;
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            current_mid = None;
+        } else if let Some(rest) = line.strip_prefix("a=mid:") {
+            current_mid = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("a=ssrc:") {
+            let Some(mid) = current_mid.as_ref() else {
+                continue;
+            };
+            let Some((ssrc_txt, _attr)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(ssrc) = ssrc_txt.parse::<u32>() else {
+                continue;
+            };
+            out.insert(ssrc, mid.clone());
+        }
+    }
+
+    out
+}
+
+fn parse_offer_media_mids(sdp: &str) -> Vec<(crate::MediaKind, String)> {
+    let mut out = Vec::new();
+    let mut current_media = None::<crate::MediaKind>;
+
+    for line in sdp.lines() {
+        if let Some(rest) = line.strip_prefix("m=") {
+            current_media = if rest.starts_with("audio ") {
+                Some(crate::MediaKind::Audio)
+            } else if rest.starts_with("video ") {
+                Some(crate::MediaKind::Video)
+            } else {
+                None
+            };
+        } else if let Some(rest) = line.strip_prefix("a=mid:") {
+            if let Some(media_kind) = current_media {
+                out.push((media_kind, rest.trim().to_string()));
+            }
+        }
+    }
+
+    out
+}
+
+fn parse_offer_mid_routing(sdp: &str) -> HashMap<String, MidRoutingInfo> {
+    let mut out: HashMap<String, MidRoutingInfo> = HashMap::new();
+    let mut current_mid = None::<String>;
+    let mut current_rids = Vec::<String>::new();
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            current_mid = None;
+            current_rids.clear();
+        } else if let Some(rest) = line.strip_prefix("a=mid:") {
+            let mid = rest.trim().to_string();
+            current_mid = Some(mid.clone());
+            out.entry(mid).or_default();
+        } else if let Some(rest) = line.strip_prefix("a=extmap:") {
+            let Some(mid) = current_mid.as_ref() else {
+                continue;
+            };
+            let Some((id_txt, uri_and_rest)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(id) = id_txt.split('/').next().unwrap_or("").parse::<u8>() else {
+                continue;
+            };
+            let uri = uri_and_rest.split_whitespace().next().unwrap_or("");
+            if uri == "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id" {
+                out.entry(mid.clone()).or_default().rid_ext_id = Some(id);
+            }
+        } else if let Some(rest) = line.strip_prefix("a=rid:") {
+            let Some(mid) = current_mid.as_ref() else {
+                continue;
+            };
+            let mut parts = rest.split_whitespace();
+            let Some(rid) = parts.next() else {
+                continue;
+            };
+            let Some(direction) = parts.next() else {
+                continue;
+            };
+            if direction == "send" {
+                let rid = rid.to_string();
+                if !current_rids.contains(&rid) {
+                    current_rids.push(rid.clone());
+                }
+                let routing = out.entry(mid.clone()).or_default();
+                if !routing.send_rids.contains(&rid) {
+                    routing.send_rids.push(rid);
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("a=simulcast:") {
+            let Some(mid) = current_mid.as_ref() else {
+                continue;
+            };
+            let Some(send_part) = rest
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix("send "))
+                .or_else(|| rest.strip_prefix("send "))
+            else {
+                continue;
+            };
+
+            let ordered = send_part
+                .split(';')
+                .flat_map(|group| group.split(','))
+                .filter_map(|token| {
+                    let token = token.trim().trim_start_matches('~');
+                    (!token.is_empty()).then_some(token.to_string())
+                })
+                .collect::<Vec<_>>();
+            if !ordered.is_empty() {
+                out.entry(mid.clone()).or_default().send_rids = ordered;
+            }
+        }
+    }
+
+    out
+}
+
+fn parse_rtp_rid(pkt: &[u8], ext_id: u8) -> Option<String> {
+    let data = parse_rtp_header_extension(pkt, ext_id)?;
+    std::str::from_utf8(data).ok().map(ToString::to_string)
+}
+
+fn parse_rtp_header_extension<'a>(pkt: &'a [u8], ext_id: u8) -> Option<&'a [u8]> {
+    if pkt.len() < 12 || ext_id == 0 || ext_id > 14 {
+        return None;
+    }
+    let v = pkt[0] >> 6;
+    if v != 2 {
+        return None;
+    }
+    let cc = (pkt[0] & 0x0f) as usize;
+    let has_ext = (pkt[0] & 0x10) != 0;
+    let mut off = 12usize.checked_add(cc.checked_mul(4)?)?;
+    if pkt.len() < off || !has_ext || pkt.len() < off + 4 {
+        return None;
+    }
+    let profile = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+    let ext_words = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) as usize;
+    off += 4;
+    let ext_end = off.checked_add(ext_words.checked_mul(4)?)?;
+    if pkt.len() < ext_end {
+        return None;
+    }
+    if profile != 0xBEDE {
+        return None;
+    }
+
+    let mut cursor = off;
+    while cursor < ext_end {
+        let b = pkt[cursor];
+        cursor += 1;
+        if b == 0 {
+            continue;
+        }
+        let id = b >> 4;
+        let len = ((b & 0x0f) as usize) + 1;
+        if cursor.checked_add(len)? > ext_end {
+            return None;
+        }
+        let data = &pkt[cursor..cursor + len];
+        cursor += len;
+        if id == ext_id {
+            return Some(data);
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use gstreamer as gst;
+
+    fn manager() -> RoomManager {
+        let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
+        RoomManager::new(gst)
+    }
+
+    fn publish_tracks() -> Vec<MeetingPublishTrack> {
+        vec![
+            MeetingPublishTrack {
+                track_id: "alice-audio".to_string(),
+                media_kind: crate::MediaKind::Audio,
+                mid: None,
+            },
+            MeetingPublishTrack {
+                track_id: "alice-video-1".to_string(),
+                media_kind: crate::MediaKind::Video,
+                mid: None,
+            },
+            MeetingPublishTrack {
+                track_id: "alice-video-2".to_string(),
+                media_kind: crate::MediaKind::Video,
+                mid: None,
+            },
+            MeetingPublishTrack {
+                track_id: "alice-video-3".to_string(),
+                media_kind: crate::MediaKind::Video,
+                mid: None,
+            },
+            MeetingPublishTrack {
+                track_id: "alice-video-4".to_string(),
+                media_kind: crate::MediaKind::Video,
+                mid: None,
+            },
+        ]
+    }
+
+    fn join_publish_and_subscribe(manager: &RoomManager, room: &RoomId) {
+        manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        manager
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+        manager
+            .meeting_publish_tracks(room.clone(), "alice", publish_tracks())
+            .expect("alice publishes");
+        manager
+            .meeting_subscribe(
+                room.clone(),
+                "bob",
+                vec![
+                    "alice-audio".to_string(),
+                    "alice-video-1".to_string(),
+                    "alice-video-2".to_string(),
+                    "alice-video-3".to_string(),
+                    "alice-video-4".to_string(),
+                ],
+            )
+            .expect("bob subscribes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn room_policy_mode_recomputes_effective_subscriptions() {
+        let manager = manager();
+        let room = RoomId("room-policy".to_string());
+        join_publish_and_subscribe(&manager, &room);
+
+        let requested = manager
+            .meeting_list_subscription_requests(room.clone(), "bob")
+            .expect("requested tracks");
+        let effective_standard = manager
+            .meeting_list_effective_subscriptions(room.clone(), "bob")
+            .expect("effective tracks in standard mode");
+
+        let revision = manager
+            .meeting_set_policy_mode(room.clone(), MeetingPolicyMode::LowBandwidth)
+            .expect("set low bandwidth policy");
+        let effective_low_bandwidth = manager
+            .meeting_list_effective_subscriptions(room.clone(), "bob")
+            .expect("effective tracks in low bandwidth mode");
+
+        assert_eq!(
+            manager.meeting_policy_mode(room.clone()).unwrap(),
+            MeetingPolicyMode::LowBandwidth
+        );
+        assert!(revision > 0);
+        assert_eq!(requested.len(), 5);
+        assert_eq!(effective_standard.len(), 5);
+        assert_eq!(effective_low_bandwidth.len(), 4);
+        assert!(requested.contains(&"alice-video-4".to_string()));
+        assert!(!effective_low_bandwidth.contains(&"alice-video-4".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_leave_prunes_requests_and_effective_tracks() {
+        let manager = manager();
+        let room = RoomId("room-leave".to_string());
+        join_publish_and_subscribe(&manager, &room);
+
+        manager
+            .meeting_leave(room.clone(), "alice")
+            .await
+            .expect("alice leaves");
+
+        let requested = manager
+            .meeting_list_subscription_requests(room.clone(), "bob")
+            .expect("bob requested tracks after alice leaves");
+        let effective = manager
+            .meeting_list_effective_subscriptions(room.clone(), "bob")
+            .expect("bob effective tracks after alice leaves");
+        let publications = manager
+            .meeting_list_publications(room.clone())
+            .expect("publications after alice leaves");
+
+        assert!(requested.is_empty());
+        assert!(effective.is_empty());
+        assert!(publications.is_empty());
+    }
+
+    #[test]
+    fn observed_streams_are_tracked_by_ssrc() {
+        let manager = manager();
+        let room = RoomId("room-streams".to_string());
+
+        manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        manager
+            .meeting_publish_tracks(room.clone(), "alice", publish_tracks())
+            .expect("alice publishes");
+
+        let pkt = RtpPacket {
+            pad_name: "src_0".to_string(),
+            caps: gst::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", "VP8")
+                .build(),
+            data: Bytes::from_static(&[]),
+            meta: media::RtpMeta {
+                ssrc: Some(0x1122_3344),
+                sequence_number: Some(1),
+                timestamp: Some(1),
+                temporal_layer: Some(0),
+            },
+            pts: None,
+            dts: None,
+            duration: None,
+        };
+
+        manager.forward_meeting_rtp(&room, "alice", pkt);
+
+        let streams = manager
+            .meeting_list_streams(room)
+            .expect("meeting streams should be listable");
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].track_id.starts_with("alice-video-"));
+        assert_eq!(streams[0].publisher_id, "alice");
+        assert_eq!(streams[0].ssrc, 0x1122_3344);
+        assert_eq!(streams[0].encoding_id, "ssrc:287454020");
+        assert_eq!(streams[0].mid, None);
+        assert_eq!(streams[0].rid, None);
+        assert_eq!(streams[0].spatial_layer, None);
+    }
+
+    #[test]
+    fn parses_offer_ssrc_to_mid_map() {
+        let sdp = "\
+v=0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=ssrc:1234 cname:test\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n\
+a=ssrc:5678 cname:test\r\n";
+
+        let map = parse_offer_ssrc_to_mid(sdp);
+        assert_eq!(map.get(&1234).map(String::as_str), Some("0"));
+        assert_eq!(map.get(&5678).map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn parses_offer_media_mids() {
+        let sdp = "\
+v=0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:audio-mid\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:video-mid\r\n";
+
+        let mids = parse_offer_media_mids(sdp);
+        assert_eq!(
+            mids,
+            vec![
+                (crate::MediaKind::Audio, "audio-mid".to_string()),
+                (crate::MediaKind::Video, "video-mid".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_offer_mid_routing_info() {
+        let sdp = "\
+v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:video-mid\r\n\
+a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n\
+a=rid:f send\r\n\
+a=rid:h send\r\n\
+a=simulcast:send f;h\r\n";
+
+        let routing = parse_offer_mid_routing(sdp);
+        let video = routing.get("video-mid").expect("video mid must be parsed");
+        assert_eq!(video.rid_ext_id, Some(4));
+        assert_eq!(video.send_rids, vec!["f".to_string(), "h".to_string()]);
+    }
+
+    #[test]
+    fn parses_rtp_rid_from_one_byte_header_extension() {
+        let pkt = [
+            0x90, 0x60, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 1, // RTP header, X=1
+            0xBE, 0xDE, 0x00, 0x01, // one-byte extension, 1 word
+            0x30, b'h', 0x00, 0x00, // id=3, len=1 byte
+        ];
+
+        assert_eq!(parse_rtp_rid(&pkt, 3), Some("h".to_string()));
+    }
 }

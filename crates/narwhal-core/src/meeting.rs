@@ -8,12 +8,19 @@ pub enum RoomMode {
     Meeting,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeetingPolicyMode {
+    Standard,
+    LowBandwidth,
+}
+
 #[derive(Clone, Debug)]
 pub struct MeetingRoomState {
     pub room_id: RoomId,
+    pub policy_mode: MeetingPolicyMode,
     pub participants: HashMap<ParticipantId, ParticipantState>,
     pub publications: HashMap<TrackId, Publication>,
-    pub subscriptions: HashMap<ParticipantId, HashSet<TrackId>>,
+    pub subscription_requests: HashMap<ParticipantId, HashSet<TrackId>>,
     pub revision: u64,
 }
 
@@ -41,9 +48,10 @@ impl MeetingRoomState {
     pub fn new(room_id: RoomId) -> Self {
         Self {
             room_id,
+            policy_mode: MeetingPolicyMode::Standard,
             participants: HashMap::new(),
             publications: HashMap::new(),
-            subscriptions: HashMap::new(),
+            subscription_requests: HashMap::new(),
             revision: 0,
         }
     }

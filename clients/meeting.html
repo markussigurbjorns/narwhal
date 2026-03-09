@@ -106,6 +106,27 @@
         color: var(--muted);
       }
 
+      .inline-field {
+        display: grid;
+        gap: 6px;
+        margin: 10px 0 0;
+      }
+
+      select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 10px;
+        font: inherit;
+        background: white;
+      }
+
+      .meta {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
       pre {
         margin: 8px 0 0;
         min-height: 220px;
@@ -188,6 +209,14 @@
             <button id="renegotiate" class="secondary" disabled>Sync Now</button>
             <button id="leave" class="danger" disabled>Leave</button>
           </div>
+          <label class="inline-field">
+            Policy Mode
+            <select id="policy-mode" disabled>
+              <option value="standard">Standard</option>
+              <option value="low_bandwidth">Low Bandwidth</option>
+            </select>
+          </label>
+          <p class="meta" id="policy-meta">Policy: (not connected)</p>
           <p class="status" id="status">Idle</p>
           <pre id="log"></pre>
         </article>
@@ -206,8 +235,12 @@
             <ul id="participants-list"></ul>
             <h3>Publications</h3>
             <ul id="publications-list"></ul>
-            <h3>My Subscriptions</h3>
-            <ul id="subscriptions-list"></ul>
+            <h3>Requested Subscriptions</h3>
+            <ul id="requested-subscriptions-list"></ul>
+            <h3>Effective Subscriptions</h3>
+            <ul id="effective-subscriptions-list"></ul>
+            <h3>Observed Streams</h3>
+            <ul id="streams-list"></ul>
           </article>
         </section>
       </section>

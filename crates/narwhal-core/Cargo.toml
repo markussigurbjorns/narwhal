@@ -11,3 +11,7 @@ uuid = { version = "1.21.0", features = ["v4"] }
 tracing = "0.1.44"
 
 media = { path = "../media" }
+
+[dev-dependencies]
+bytes = "1.11.1"
+gstreamer = { version = "0.25.0", features = ["v1_16"] }

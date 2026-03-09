@@ -5,7 +5,9 @@ use axum::{
     },
     response::IntoResponse,
 };
-use narwhal_core::{MeetingPublishTrack, MediaKind, RoomId, RoomManager, RoomMode};
+use narwhal_core::{
+    MeetingPolicyMode, MeetingPublishTrack, MediaKind, RoomId, RoomManager, RoomMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -116,6 +118,34 @@ struct TrackIdsParams {
     track_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireMeetingPolicyMode {
+    Standard,
+    LowBandwidth,
+}
+
+impl From<WireMeetingPolicyMode> for MeetingPolicyMode {
+    fn from(value: WireMeetingPolicyMode) -> Self {
+        match value {
+            WireMeetingPolicyMode::Standard => MeetingPolicyMode::Standard,
+            WireMeetingPolicyMode::LowBandwidth => MeetingPolicyMode::LowBandwidth,
+        }
+    }
+}
+
+fn policy_mode_label(mode: MeetingPolicyMode) -> &'static str {
+    match mode {
+        MeetingPolicyMode::Standard => "standard",
+        MeetingPolicyMode::LowBandwidth => "low_bandwidth",
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPolicyModeParams {
+    mode: WireMeetingPolicyMode,
+}
+
 async fn handle_socket(mut socket: WebSocket, rooms: RoomManager) {
     let mut state = SessionState { rooms, joined: None };
 
@@ -191,7 +221,10 @@ async fn handle_text(state: &mut SessionState, text: String) -> Option<RpcRespon
         "drain_ice" => drain_ice(state, req.params).await,
         "list_participants" => list_participants(state).await,
         "list_publications" => list_publications(state).await,
+        "list_streams" => list_streams(state).await,
         "list_subscriptions" => list_subscriptions(state).await,
+        "get_policy_mode" => get_policy_mode(state).await,
+        "set_policy_mode" => set_policy_mode(state, req.params).await,
         "publish_tracks" => publish_tracks(state, req.params).await,
         "unpublish_tracks" => unpublish_tracks(state, req.params).await,
         "subscribe" => subscribe(state, req.params).await,
@@ -472,6 +505,39 @@ async fn list_publications(state: &mut SessionState) -> Result<Value, RpcError> 
     }))
 }
 
+async fn list_streams(state: &mut SessionState) -> Result<Value, RpcError> {
+    let joined = state
+        .joined
+        .as_ref()
+        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+
+    let list = state
+        .rooms
+        .meeting_list_streams(joined.room.clone())
+        .map_err(|err| rpc_error(4102, err.to_string()))?;
+
+    Ok(json!({
+        "streams": list
+            .into_iter()
+            .map(|stream| {
+                json!({
+                    "track_id": stream.track_id,
+                    "publisher_id": stream.publisher_id,
+                    "media_kind": match stream.media_kind {
+                        MediaKind::Audio => "audio",
+                        MediaKind::Video => "video",
+                    },
+                    "ssrc": stream.ssrc,
+                    "encoding_id": stream.encoding_id,
+                    "mid": stream.mid,
+                    "rid": stream.rid,
+                    "spatial_layer": stream.spatial_layer
+                })
+            })
+            .collect::<Vec<_>>()
+    }))
+}
+
 async fn list_participants(state: &mut SessionState) -> Result<Value, RpcError> {
     let joined = state
         .joined
@@ -502,13 +568,57 @@ async fn list_subscriptions(state: &mut SessionState) -> Result<Value, RpcError>
         .as_ref()
         .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
 
-    let track_ids = state
+    let requested_track_ids = state
         .rooms
-        .meeting_list_subscriptions(joined.room.clone(), &joined.participant_id)
+        .meeting_list_subscription_requests(joined.room.clone(), &joined.participant_id)
+        .map_err(|err| rpc_error(4098, err.to_string()))?;
+    let effective_track_ids = state
+        .rooms
+        .meeting_list_effective_subscriptions(joined.room.clone(), &joined.participant_id)
         .map_err(|err| rpc_error(4098, err.to_string()))?;
 
     Ok(json!({
-        "track_ids": track_ids
+        "requested_track_ids": requested_track_ids,
+        "effective_track_ids": effective_track_ids,
+        "track_ids": effective_track_ids
+    }))
+}
+
+async fn get_policy_mode(state: &mut SessionState) -> Result<Value, RpcError> {
+    let joined = state
+        .joined
+        .as_ref()
+        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+
+    let mode = state
+        .rooms
+        .meeting_policy_mode(joined.room.clone())
+        .map_err(|err| rpc_error(4100, err.to_string()))?;
+
+    Ok(json!({
+        "mode": policy_mode_label(mode)
+    }))
+}
+
+async fn set_policy_mode(state: &mut SessionState, params: Value) -> Result<Value, RpcError> {
+    let joined = state
+        .joined
+        .as_mut()
+        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+    let params: SetPolicyModeParams = serde_json::from_value(params)
+        .map_err(|err| rpc_error(-32602, format!("invalid params for set_policy_mode: {err}")))?;
+
+    let mode: MeetingPolicyMode = params.mode.into();
+    let revision = state
+        .rooms
+        .meeting_set_policy_mode(joined.room.clone(), mode)
+        .map_err(|err| rpc_error(4101, err.to_string()))?;
+    joined.revision = revision;
+
+    Ok(json!({
+        "mode": policy_mode_label(mode),
+        "revision": revision,
+        "needs_renegotiation": false
     }))
 }
 
