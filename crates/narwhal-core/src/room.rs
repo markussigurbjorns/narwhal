@@ -1,13 +1,11 @@
-use crate::BroadcastRouter;
 use crate::{
-    ForwardingGraph, ForwardingKind, IceQueue, MeetingParticipantSession, MeetingPolicyMode,
-    MeetingRoomState, MidRoutingInfo, ParticipantId, ParticipantState, PublisherSession,
-    RoomFacts, RoomMode, SubscriberSession, SubscriptionPlan, VideoForwarding,
-    compile_forwarding_graph,
-    start_ice_collector,
+    BroadcastFacts, BroadcastPolicyMode, ForwardingGraph, ForwardingKind, IceQueue,
+    MeetingParticipantSession, MeetingPolicyMode, MeetingRoomState, MidRoutingInfo, ParticipantId,
+    ParticipantState, PublisherSession, RoomFacts, RoomMode, SubscriberSession, SubscriptionPlan,
+    VideoForwarding, compile_forwarding_graph, start_ice_collector,
 };
 use anyhow::Result;
-use media::{GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket};
+use media::{GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket, RtpStreamInfo, stream_info};
 use parking_lot::RwLock;
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::runtime::Handle;
@@ -46,6 +44,38 @@ pub struct MeetingParticipantInfo {
     pub display_name: Option<String>,
 }
 
+pub struct BroadcastInspection {
+    pub policy_mode: crate::BroadcastPolicyMode,
+    pub publisher_id: Option<String>,
+    pub subscriber_ids: Vec<String>,
+    pub stream_infos: Vec<BroadcastStreamInfo>,
+    pub subscriber_plans: Vec<BroadcastSubscriberPlanInfo>,
+    pub graph_edges: Vec<BroadcastGraphEdgeInfo>,
+}
+
+pub struct BroadcastStreamInfo {
+    pub media_key: String,
+    pub caps: String,
+}
+
+pub struct BroadcastSubscriberPlanInfo {
+    pub subscriber_id: String,
+    pub audio_track_ids: Vec<String>,
+    pub video: Vec<BroadcastVideoSelectionInfo>,
+}
+
+pub struct BroadcastVideoSelectionInfo {
+    pub track_id: String,
+    pub target: crate::VideoTarget,
+}
+
+pub struct BroadcastGraphEdgeInfo {
+    pub track_id: String,
+    pub subscriber_id: String,
+    pub kind: String,
+    pub video_target: Option<crate::VideoTarget>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MeetingStreamInfo {
     pub track_id: String,
@@ -70,10 +100,13 @@ struct Rooms {
 
 struct RoomState {
     mode: RoomMode,
+    broadcast_policy_mode: BroadcastPolicyMode,
     publisher: Option<PublisherSession>,
     subscribers: HashMap<String, SubscriberSession>,
     meeting_participants: HashMap<String, MeetingParticipantSession>,
-    router: BroadcastRouter,
+    broadcast_plan: SubscriptionPlan,
+    broadcast_graph: ForwardingGraph,
+    broadcast_streams: HashMap<String, RtpStreamInfo>,
     meeting: MeetingRoomState,
     meeting_plan: SubscriptionPlan,
     meeting_graph: ForwardingGraph,
@@ -128,10 +161,13 @@ impl RoomManager {
             .entry(room.clone())
             .or_insert_with(|| RoomState {
                 mode: RoomMode::Broadcast,
+                broadcast_policy_mode: BroadcastPolicyMode::Standard,
                 publisher: None,
                 subscribers: HashMap::new(),
                 meeting_participants: HashMap::new(),
-                router: BroadcastRouter::new(),
+                broadcast_plan: SubscriptionPlan::default(),
+                broadcast_graph: ForwardingGraph::default(),
+                broadcast_streams: HashMap::new(),
                 meeting: MeetingRoomState::new(room.clone()),
                 meeting_plan: SubscriptionPlan::default(),
                 meeting_graph: ForwardingGraph::default(),
@@ -146,6 +182,25 @@ impl RoomManager {
         hydrate_meeting_graph(&mut rs.meeting_graph, &rs.meeting_streams);
     }
 
+    fn recompute_broadcast_graph(rs: &mut RoomState) {
+        let Some(publisher) = rs.publisher.as_ref() else {
+            rs.broadcast_plan = SubscriptionPlan::default();
+            rs.broadcast_graph = ForwardingGraph::default();
+            return;
+        };
+
+        let facts = BroadcastFacts {
+            revision: 0,
+            policy_mode: rs.broadcast_policy_mode,
+            publisher_id: ParticipantId(publisher.id.clone()),
+            subscriber_ids: rs.subscribers.keys().cloned().map(ParticipantId).collect(),
+            audio_track_id: broadcast_track_id(crate::MediaKind::Audio),
+            video_track_id: broadcast_track_id(crate::MediaKind::Video),
+        };
+        rs.broadcast_plan = crate::build_broadcast_plan_from_facts(&facts);
+        rs.broadcast_graph = compile_forwarding_graph(&rs.broadcast_plan);
+    }
+
     pub fn meeting_policy_mode(&self, room: RoomId) -> Result<MeetingPolicyMode> {
         let g = self.inner.read();
         let rs = g
@@ -154,6 +209,32 @@ impl RoomManager {
             .ok_or_else(|| anyhow::anyhow!("room not found"))?;
         Self::require_meeting_mode(rs)?;
         Ok(rs.meeting.policy_mode)
+    }
+
+    pub fn broadcast_policy_mode(&self, room: RoomId) -> Result<BroadcastPolicyMode> {
+        let g = self.inner.read();
+        let rs = g
+            .rooms
+            .get(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_broadcast_mode(rs)?;
+        Ok(rs.broadcast_policy_mode)
+    }
+
+    pub fn broadcast_set_policy_mode(
+        &self,
+        room: RoomId,
+        policy_mode: BroadcastPolicyMode,
+    ) -> Result<()> {
+        let mut g = self.inner.write();
+        let rs = g
+            .rooms
+            .get_mut(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_broadcast_mode(rs)?;
+        rs.broadcast_policy_mode = policy_mode;
+        Self::recompute_broadcast_graph(rs);
+        Ok(())
     }
 
     pub fn meeting_set_policy_mode(
@@ -496,6 +577,81 @@ impl RoomManager {
                 .then(a.encoding_id.cmp(&b.encoding_id))
         });
         Ok(out)
+    }
+
+    pub fn broadcast_inspect(&self, room: RoomId) -> Result<BroadcastInspection> {
+        let g = self.inner.read();
+        let rs = g
+            .rooms
+            .get(&room)
+            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        Self::require_broadcast_mode(rs)?;
+
+        let mut subscriber_ids = rs.subscribers.keys().cloned().collect::<Vec<_>>();
+        subscriber_ids.sort();
+        let mut stream_infos = rs
+            .broadcast_streams
+            .values()
+            .map(|stream| BroadcastStreamInfo {
+                media_key: stream.media_key.clone(),
+                caps: stream.caps.to_string(),
+            })
+            .collect::<Vec<_>>();
+        stream_infos.sort_by(|a, b| a.media_key.cmp(&b.media_key));
+
+        let mut subscriber_plans = rs
+            .broadcast_plan
+            .per_subscriber
+            .values()
+            .map(|plan| BroadcastSubscriberPlanInfo {
+                subscriber_id: plan.subscriber_id.0.clone(),
+                audio_track_ids: plan.audio.iter().map(|selection| selection.track_id.0.clone()).collect(),
+                video: plan
+                    .video
+                    .iter()
+                    .map(|selection| BroadcastVideoSelectionInfo {
+                        track_id: selection.track_id.0.clone(),
+                        target: selection.target,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        subscriber_plans.sort_by(|a, b| a.subscriber_id.cmp(&b.subscriber_id));
+
+        let mut graph_edges = rs
+            .broadcast_graph
+            .track_subscribers
+            .iter()
+            .flat_map(|(track_id, forwardings)| {
+                forwardings.iter().map(|forwarding| BroadcastGraphEdgeInfo {
+                    track_id: track_id.0.clone(),
+                    subscriber_id: forwarding.subscriber_id.0.clone(),
+                    kind: match &forwarding.kind {
+                        ForwardingKind::Audio => "audio".to_string(),
+                        ForwardingKind::Video(_) => "video".to_string(),
+                    },
+                    video_target: match &forwarding.kind {
+                        ForwardingKind::Audio => None,
+                        ForwardingKind::Video(video) => Some(video.target),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        graph_edges.sort_by(|a, b| {
+            a.track_id
+                .cmp(&b.track_id)
+                .then(a.subscriber_id.cmp(&b.subscriber_id))
+                .then(a.kind.cmp(&b.kind))
+        });
+
+        Ok(BroadcastInspection {
+            policy_mode: rs.broadcast_policy_mode,
+            publisher_id: rs.publisher.as_ref().map(|publisher| publisher.id.clone()),
+            subscriber_ids,
+            stream_infos,
+            subscriber_plans,
+            graph_edges,
+        })
     }
 
     pub async fn meeting_leave(&self, room: RoomId, participant_id: &str) -> Result<()> {
@@ -925,6 +1081,58 @@ impl RoomManager {
         });
     }
 
+    fn forward_broadcast_rtp(&self, room: &RoomId, pkt: RtpPacket) {
+        let Some(kind) = media_kind_from_packet(&pkt) else {
+            return;
+        };
+
+        let (targets, stream_key) = {
+            let mut g = self.inner.write();
+            let Some(rs) = g.rooms.get_mut(room) else {
+                return;
+            };
+            if !matches!(rs.mode, RoomMode::Broadcast) {
+                return;
+            }
+            if let Some(info) = stream_info(&pkt) {
+                rs.broadcast_streams.insert(info.media_key.clone(), info);
+            }
+            let track_id = broadcast_track_id(kind);
+            let targets = rs
+                .broadcast_graph
+                .for_track(&track_id)
+                .iter()
+                .filter_map(|forwarding| match (&forwarding.kind, kind) {
+                    (ForwardingKind::Audio, crate::MediaKind::Audio) => rs
+                        .subscribers
+                        .get(&forwarding.subscriber_id.0)
+                        .map(|sess| sess.injector_tx.clone()),
+                    (ForwardingKind::Video(_), crate::MediaKind::Video) => rs
+                        .subscribers
+                        .get(&forwarding.subscriber_id.0)
+                        .map(|sess| sess.injector_tx.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (targets, track_id.0)
+        };
+
+        for target in targets {
+            if let Err(err) = target.try_send(pkt.clone()) {
+                match err {
+                    TrySendError::Full(_) => {
+                        tracing::warn!(
+                            room = %room.0,
+                            stream = %stream_key,
+                            "dropping broadcast RTP packet because subscriber injector queue is full"
+                        );
+                    }
+                    TrySendError::Closed(_) => {}
+                }
+            }
+        }
+    }
+
     async fn request_meeting_participant_keyframe(
         &self,
         room: RoomId,
@@ -986,35 +1194,33 @@ impl RoomManager {
         let ice = IceQueue::new();
         start_ice_collector(peer.ice_subscribe(), ice.clone());
 
-        let (router, old_publisher) = {
+        let old_publisher = {
             let mut g = self.inner.write();
             let rs = Self::room_mut(&mut g, &room);
             Self::require_broadcast_mode(rs)?;
 
-            let router = BroadcastRouter::new();
-            for (sub_id, tx) in rs.router.subscriber_entries() {
-                router.add_sub(sub_id, tx);
-            }
-
             let old_publisher = rs.publisher.take();
-            rs.router = router.clone();
+            rs.broadcast_streams.clear();
             // v1 policy: replace existing publisher
             rs.publisher = Some(PublisherSession {
                 id: pub_id.clone(),
                 peer,
                 ice,
             });
-            (router, old_publisher)
+            Self::recompute_broadcast_graph(rs);
+            old_publisher
         };
 
         if let Some(old_publisher) = old_publisher {
             old_publisher.peer.stop().await?;
         }
 
+        let rooms = self.clone();
+        let room_for_forward = room.clone();
         tokio::spawn(async move {
             let mut rx = tap.rx;
             while let Some(pkt) = rx.recv().await {
-                router.fanout(pkt);
+                rooms.forward_broadcast_rtp(&room_for_forward, pkt);
             }
         });
 
@@ -1091,6 +1297,8 @@ impl RoomManager {
                 return Err(anyhow::anyhow!("publisher id mismatch"));
             }
 
+            rs.broadcast_streams.clear();
+            Self::recompute_broadcast_graph(rs);
             rs.publisher.take().unwrap()
         };
 
@@ -1113,7 +1321,7 @@ impl RoomManager {
             rs.publisher
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no publisher"))?;
-            rs.router.stream_infos()
+            rs.broadcast_streams.values().cloned().collect::<Vec<_>>()
         };
 
         if stream_infos.is_empty() {
@@ -1155,14 +1363,6 @@ impl RoomManager {
             .ok_or_else(|| anyhow::anyhow!("whep injector was not created during negotiation"))?;
         peer.play().await?;
 
-        // Register this subscriber in the room router
-        {
-            let mut g = self.inner.write();
-            let rs = Self::room_mut(&mut g, &room);
-            Self::require_broadcast_mode(rs)?;
-            rs.router.add_sub(sub_id.clone(), injector.tx.clone());
-        }
-
         // Prompt a fresh keyframe as soon as a subscriber joins so startup
         // doesn't depend on the publisher's natural GOP interval.
         if let Err(err) = self.request_publisher_keyframe(room.clone()).await {
@@ -1182,8 +1382,10 @@ impl RoomManager {
                     id: sub_id.clone(),
                     peer,
                     ice,
+                    injector_tx: injector.tx.clone(),
                 },
             );
+            Self::recompute_broadcast_graph(rs);
         }
 
         Ok(SdpResponse {
@@ -1247,11 +1449,12 @@ impl RoomManager {
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             Self::require_broadcast_mode(rs)?;
 
-            rs.router.remove_sub(sub_id);
-
-            rs.subscribers
+            let sub = rs
+                .subscribers
                 .remove(sub_id)
-                .ok_or_else(|| anyhow::anyhow!("subscriber not found"))?
+                .ok_or_else(|| anyhow::anyhow!("subscriber not found"))?;
+            Self::recompute_broadcast_graph(rs);
+            sub
         };
 
         // stop media outside lock
@@ -1269,6 +1472,13 @@ fn media_kind_from_packet(pkt: &RtpPacket) -> Option<crate::MediaKind> {
             "video" => Some(crate::MediaKind::Video),
             _ => None,
         })
+}
+
+fn broadcast_track_id(kind: crate::MediaKind) -> crate::TrackId {
+    match kind {
+        crate::MediaKind::Audio => crate::TrackId("__broadcast_audio".to_string()),
+        crate::MediaKind::Video => crate::TrackId("__broadcast_video".to_string()),
+    }
 }
 
 fn video_forwarding_allows_packet(
@@ -1609,6 +1819,34 @@ mod tests {
         assert_eq!(effective_low_bandwidth.len(), 4);
         assert!(requested.contains(&"alice-video-4".to_string()));
         assert!(!effective_low_bandwidth.contains(&"alice-video-4".to_string()));
+    }
+
+    #[test]
+    fn broadcast_policy_mode_is_selectable() {
+        let manager = manager();
+        let room = RoomId("broadcast-policy".to_string());
+        manager.ensure_room_mode(room.clone(), RoomMode::Broadcast);
+
+        assert_eq!(
+            manager.broadcast_policy_mode(room.clone()).unwrap(),
+            BroadcastPolicyMode::Standard
+        );
+
+        manager
+            .broadcast_set_policy_mode(room.clone(), BroadcastPolicyMode::AudioOnly)
+            .expect("set audio-only broadcast policy");
+        assert_eq!(
+            manager.broadcast_policy_mode(room.clone()).unwrap(),
+            BroadcastPolicyMode::AudioOnly
+        );
+
+        manager
+            .broadcast_set_policy_mode(room.clone(), BroadcastPolicyMode::LowBandwidth)
+            .expect("set low-bandwidth broadcast policy");
+        assert_eq!(
+            manager.broadcast_policy_mode(room).unwrap(),
+            BroadcastPolicyMode::LowBandwidth
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

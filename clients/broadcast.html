@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Narwhal Broadcast Control</title>
+    <style>
+      :root {
+        --bg: #f2efe8;
+        --panel: #fffdf9;
+        --ink: #17212b;
+        --muted: #5f6b76;
+        --line: #d8cec1;
+        --accent: #155e75;
+        --accent-2: #9a3412;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(21, 94, 117, 0.12), transparent 26rem),
+          radial-gradient(circle at top right, rgba(154, 52, 18, 0.12), transparent 18rem),
+          var(--bg);
+      }
+
+      main {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      h1, h2, h3 {
+        font-family: "IBM Plex Mono", monospace;
+      }
+
+      .grid {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 360px minmax(0, 1fr);
+      }
+
+      .stack {
+        display: grid;
+        gap: 18px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 16px;
+        box-shadow: 0 10px 30px rgba(23, 33, 43, 0.08);
+      }
+
+      label {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      input, select {
+        width: 100%;
+        margin-top: 6px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px;
+        font: inherit;
+        background: white;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 14px;
+        font: inherit;
+        cursor: pointer;
+        color: white;
+        background: var(--accent);
+      }
+
+      button.secondary {
+        background: var(--accent-2);
+      }
+
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin: 14px 0;
+      }
+
+      .status, .meta {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .lists h3 {
+        margin: 0 0 8px;
+        font-size: 14px;
+      }
+
+      .lists ul {
+        margin: 0 0 12px;
+        padding-left: 18px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      pre {
+        margin: 0;
+        min-height: 240px;
+        max-height: 420px;
+        overflow: auto;
+        padding: 12px;
+        border-radius: 12px;
+        background: #101722;
+        color: #d9f5ea;
+        font-size: 12px;
+      }
+
+      @media (max-width: 900px) {
+        .grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="panel">
+        <h1>Broadcast Control</h1>
+        <p class="meta">Inspect live WHIP/WHEP rooms and change broadcast policy without using raw curl.</p>
+        <p class="meta"><a href="/clients">Open Broadcast Media Demo</a> · <a href="/clients/meeting">Open Meeting Demo</a></p>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <label>
+            Base URL
+            <input id="base-url" value="">
+          </label>
+          <label>
+            Room
+            <input id="room" value="broadcast-room">
+          </label>
+          <label>
+            Policy Mode
+            <select id="policy-mode">
+              <option value="standard">Standard</option>
+              <option value="low_bandwidth">Low Bandwidth</option>
+              <option value="audio_only">Audio Only</option>
+            </select>
+          </label>
+          <div class="actions">
+            <button id="refresh">Refresh</button>
+            <button id="apply-policy" class="secondary">Apply Policy</button>
+          </div>
+          <p id="status" class="status">Idle</p>
+        </article>
+
+        <section class="stack">
+          <article class="panel lists">
+            <h2>Summary</h2>
+            <h3>Subscribers</h3>
+            <ul id="subscribers"></ul>
+            <h3>Streams</h3>
+            <ul id="streams"></ul>
+            <h3>Subscriber Plans</h3>
+            <ul id="plans"></ul>
+            <h3>Graph Edges</h3>
+            <ul id="edges"></ul>
+          </article>
+          <article class="panel">
+            <h2>Raw Inspection</h2>
+            <pre id="raw-json"></pre>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="/clients/broadcast.js"></script>
+  </body>
+</html>

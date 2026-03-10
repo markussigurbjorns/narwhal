@@ -79,6 +79,17 @@
         font: inherit;
       }
 
+      .checkline {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .checkline input {
+        width: auto;
+        margin: 0;
+      }
+
       .actions {
         display: flex;
         gap: 8px;
@@ -199,6 +210,10 @@
         background: #0b1220;
       }
 
+      .tile.remote-primary {
+        grid-column: 1 / -1;
+      }
+
       .tile header {
         background: #0f1d34;
         color: #eaf1fb;
@@ -238,6 +253,18 @@
           <label>
             WS URL
             <input id="ws-url" value="">
+          </label>
+          <label class="inline-field">
+            Capture Preset
+            <select id="capture-preset">
+              <option value="640x360">360p</option>
+              <option value="1280x720" selected>720p</option>
+              <option value="1920x1080">1080p</option>
+            </select>
+          </label>
+          <label class="checkline">
+            <input id="enable-simulcast" type="checkbox" checked>
+            Enable video simulcast (RID)
           </label>
           <div class="actions">
             <button id="connect">Connect</button>
@@ -290,6 +317,8 @@
             <ul id="effective-subscriptions-list"></ul>
             <h3>Observed Streams</h3>
             <ul id="streams-list"></ul>
+            <h3>Media Stats</h3>
+            <ul id="media-stats-list"></ul>
           </article>
         </section>
       </section>

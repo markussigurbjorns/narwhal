@@ -14,6 +14,13 @@ pub enum MeetingPolicyMode {
     LowBandwidth,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroadcastPolicyMode {
+    Standard,
+    LowBandwidth,
+    AudioOnly,
+}
+
 #[derive(Clone, Debug)]
 pub struct MeetingRoomState {
     pub room_id: RoomId,

@@ -15,6 +15,7 @@ pub struct SubscriberSession {
     pub id: String,
     pub peer: PeerSession,
     pub ice: IceQueue,
+    pub injector_tx: mpsc::Sender<RtpPacket>,
 }
 
 pub struct MeetingParticipantSession {

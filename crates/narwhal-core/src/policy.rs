@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{MediaKind, MeetingPolicyMode, MeetingRoomState, ParticipantId, RoomId, TrackId};
+use crate::{
+    BroadcastPolicyMode, MediaKind, MeetingPolicyMode, MeetingRoomState, ParticipantId, RoomId,
+    TrackId,
+};
 
 #[derive(Clone, Debug)]
 pub struct RoomFacts {
@@ -24,6 +27,16 @@ pub struct PublicationFacts {
     pub publisher_id: ParticipantId,
     pub media_kind: MediaKind,
     pub mid: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BroadcastFacts {
+    pub revision: u64,
+    pub policy_mode: BroadcastPolicyMode,
+    pub publisher_id: ParticipantId,
+    pub subscriber_ids: Vec<ParticipantId>,
+    pub audio_track_id: TrackId,
+    pub video_track_id: TrackId,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -190,6 +203,108 @@ pub fn build_plan_for_mode(facts: &RoomFacts) -> SubscriptionPlan {
     match facts.policy_mode {
         MeetingPolicyMode::Standard => StandardMeetingPolicy.build_plan(facts),
         MeetingPolicyMode::LowBandwidth => LowBandwidthPolicy.build_plan(facts),
+    }
+}
+
+pub fn build_broadcast_plan(
+    revision: u64,
+    publisher_id: ParticipantId,
+    subscriber_ids: impl IntoIterator<Item = ParticipantId>,
+    audio_track_id: TrackId,
+    video_track_id: TrackId,
+) -> SubscriptionPlan {
+    let mut plan = empty_plan(revision);
+
+    for subscriber_id in subscriber_ids {
+        let subscriber_plan = SubscriberPlan {
+            subscriber_id: subscriber_id.clone(),
+            video: vec![VideoSelection {
+                track_id: video_track_id.clone(),
+                publisher_id: publisher_id.clone(),
+                mid: None,
+                target: VideoTarget::High,
+            }],
+            audio: vec![AudioSelection {
+                track_id: audio_track_id.clone(),
+                publisher_id: publisher_id.clone(),
+                mid: None,
+            }],
+        };
+
+        plan.track_subscribers
+            .entry(audio_track_id.clone())
+            .or_default()
+            .push(subscriber_id.clone());
+        plan.track_subscribers
+            .entry(video_track_id.clone())
+            .or_default()
+            .push(subscriber_id.clone());
+        plan.per_subscriber.insert(subscriber_id, subscriber_plan);
+    }
+
+    plan
+}
+
+pub fn build_broadcast_plan_from_facts(facts: &BroadcastFacts) -> SubscriptionPlan {
+    match facts.policy_mode {
+        BroadcastPolicyMode::Standard => build_broadcast_plan(
+            facts.revision,
+            facts.publisher_id.clone(),
+            facts.subscriber_ids.clone(),
+            facts.audio_track_id.clone(),
+            facts.video_track_id.clone(),
+        ),
+        BroadcastPolicyMode::LowBandwidth => {
+            let mut plan = empty_plan(facts.revision);
+            for subscriber_id in &facts.subscriber_ids {
+                let subscriber_plan = SubscriberPlan {
+                    subscriber_id: subscriber_id.clone(),
+                    video: vec![VideoSelection {
+                        track_id: facts.video_track_id.clone(),
+                        publisher_id: facts.publisher_id.clone(),
+                        mid: None,
+                        target: VideoTarget::Low,
+                    }],
+                    audio: vec![AudioSelection {
+                        track_id: facts.audio_track_id.clone(),
+                        publisher_id: facts.publisher_id.clone(),
+                        mid: None,
+                    }],
+                };
+                plan.track_subscribers
+                    .entry(facts.audio_track_id.clone())
+                    .or_default()
+                    .push(subscriber_id.clone());
+                plan.track_subscribers
+                    .entry(facts.video_track_id.clone())
+                    .or_default()
+                    .push(subscriber_id.clone());
+                plan.per_subscriber
+                    .insert(subscriber_id.clone(), subscriber_plan);
+            }
+            plan
+        }
+        BroadcastPolicyMode::AudioOnly => {
+            let mut plan = empty_plan(facts.revision);
+            for subscriber_id in &facts.subscriber_ids {
+                let subscriber_plan = SubscriberPlan {
+                    subscriber_id: subscriber_id.clone(),
+                    video: Vec::new(),
+                    audio: vec![AudioSelection {
+                        track_id: facts.audio_track_id.clone(),
+                        publisher_id: facts.publisher_id.clone(),
+                        mid: None,
+                    }],
+                };
+                plan.track_subscribers
+                    .entry(facts.audio_track_id.clone())
+                    .or_default()
+                    .push(subscriber_id.clone());
+                plan.per_subscriber
+                    .insert(subscriber_id.clone(), subscriber_plan);
+            }
+            plan
+        }
     }
 }
 
@@ -430,5 +545,69 @@ mod tests {
         let alice = participant_id("alice");
 
         assert!(plan.effective_track_ids_for(&alice).is_empty());
+    }
+
+    #[test]
+    fn broadcast_plan_includes_all_subscribers() {
+        let plan = build_broadcast_plan_from_facts(&BroadcastFacts {
+            revision: 9,
+            policy_mode: BroadcastPolicyMode::Standard,
+            publisher_id: participant_id("publisher"),
+            subscriber_ids: vec![participant_id("sub-a"), participant_id("sub-b")],
+            audio_track_id: track_id("__broadcast_audio"),
+            video_track_id: track_id("__broadcast_video"),
+        });
+
+        assert_eq!(plan.room_revision, 9);
+        assert_eq!(plan.per_subscriber.len(), 2);
+        assert_eq!(
+            plan.effective_track_ids_for(&participant_id("sub-a")),
+            vec![track_id("__broadcast_audio"), track_id("__broadcast_video")]
+        );
+        assert_eq!(
+            plan.track_subscribers.get(&track_id("__broadcast_video")).map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn broadcast_low_bandwidth_downgrades_video_target() {
+        let plan = build_broadcast_plan_from_facts(&BroadcastFacts {
+            revision: 10,
+            policy_mode: BroadcastPolicyMode::LowBandwidth,
+            publisher_id: participant_id("publisher"),
+            subscriber_ids: vec![participant_id("sub-a")],
+            audio_track_id: track_id("__broadcast_audio"),
+            video_track_id: track_id("__broadcast_video"),
+        });
+
+        let subscriber = plan
+            .per_subscriber
+            .get(&participant_id("sub-a"))
+            .expect("subscriber plan");
+        assert_eq!(subscriber.video.len(), 1);
+        assert_eq!(subscriber.video[0].target, VideoTarget::Low);
+    }
+
+    #[test]
+    fn broadcast_audio_only_excludes_video() {
+        let plan = build_broadcast_plan_from_facts(&BroadcastFacts {
+            revision: 11,
+            policy_mode: BroadcastPolicyMode::AudioOnly,
+            publisher_id: participant_id("publisher"),
+            subscriber_ids: vec![participant_id("sub-a")],
+            audio_track_id: track_id("__broadcast_audio"),
+            video_track_id: track_id("__broadcast_video"),
+        });
+
+        let subscriber = plan
+            .per_subscriber
+            .get(&participant_id("sub-a"))
+            .expect("subscriber plan");
+        assert!(subscriber.video.is_empty());
+        assert_eq!(subscriber.audio.len(), 1);
+        assert!(!plan
+            .track_subscribers
+            .contains_key(&track_id("__broadcast_video")));
     }
 }

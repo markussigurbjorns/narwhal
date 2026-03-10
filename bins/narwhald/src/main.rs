@@ -33,6 +33,9 @@ fn clients_routes() -> Router {
         .route("/clients", get(clients_index))
         .route("/clients/", get(clients_index))
         .route("/clients/app.js", get(clients_app_js))
+        .route("/clients/broadcast", get(clients_broadcast))
+        .route("/clients/broadcast/", get(clients_broadcast))
+        .route("/clients/broadcast.js", get(clients_broadcast_js))
         .route("/clients/meeting", get(clients_meeting))
         .route("/clients/meeting/", get(clients_meeting))
         .route("/clients/meeting.js", get(clients_meeting_js))
@@ -53,6 +56,24 @@ async fn clients_app_js() -> impl IntoResponse {
         StatusCode::OK,
         headers,
         include_str!("../../../clients/app.js"),
+    )
+}
+
+async fn clients_broadcast() -> Html<&'static str> {
+    Html(include_str!("../../../clients/broadcast.html"))
+}
+
+async fn clients_broadcast_js() -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+
+    (
+        StatusCode::OK,
+        headers,
+        include_str!("../../../clients/broadcast.js"),
     )
 }
 

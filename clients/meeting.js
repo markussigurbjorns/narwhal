@@ -2,11 +2,14 @@ const defaultWsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://
 const defaultStunUrl = "stun:turn.makudoku.com:3478";
 const urlParams = new URLSearchParams(window.location.search);
 const enableIceRecoveryRenegotiation = urlParams.get("ice_recovery") === "1";
+const enableSimulcastByDefault = urlParams.get("simulcast") !== "0";
 
 const el = {
   room: document.querySelector("#room"),
   displayName: document.querySelector("#display-name"),
   wsUrl: document.querySelector("#ws-url"),
+  capturePreset: document.querySelector("#capture-preset"),
+  enableSimulcast: document.querySelector("#enable-simulcast"),
   connect: document.querySelector("#connect"),
   renegotiate: document.querySelector("#renegotiate"),
   leave: document.querySelector("#leave"),
@@ -24,9 +27,11 @@ const el = {
   requestedSubscriptionsList: document.querySelector("#requested-subscriptions-list"),
   effectiveSubscriptionsList: document.querySelector("#effective-subscriptions-list"),
   streamsList: document.querySelector("#streams-list"),
+  mediaStatsList: document.querySelector("#media-stats-list"),
 };
 
 el.wsUrl.value = defaultWsUrl;
+el.enableSimulcast.checked = enableSimulcastByDefault;
 if (!el.displayName.value) {
   el.displayName.value = `guest-${Math.floor(Math.random() * 9000 + 1000)}`;
 }
@@ -50,6 +55,7 @@ let currentPolicyMode = null;
 let latestPublications = [];
 let latestRequestedTrackIds = [];
 let selectedPublisherId = null;
+let statsTimer = null;
 
 function setStatus(text) {
   el.status.textContent = text;
@@ -67,6 +73,7 @@ function setButtons(connected) {
   el.leave.disabled = !connected;
   el.renegotiate.disabled = !connected;
   el.policyMode.disabled = !connected;
+  el.enableSimulcast.disabled = connected;
   el.publisherSelect.disabled = !connected;
   el.applySubscriptions.disabled = !connected;
 }
@@ -100,7 +107,7 @@ function ensureRemoteTile() {
   let section = document.querySelector(`[data-stream-id="remote-main"]`);
   if (section) return section.querySelector("video");
   section = document.createElement("section");
-  section.className = "tile";
+  section.className = "tile remote-primary";
   section.dataset.streamId = "remote-main";
   const header = document.createElement("header");
   header.textContent = "Remote";
@@ -110,6 +117,17 @@ function ensureRemoteTile() {
   section.append(header, video);
   el.videos.appendChild(section);
   return video;
+}
+
+function getCaptureConstraints() {
+  const [width, height] = (el.capturePreset.value || "1280x720")
+    .split("x")
+    .map((value) => Number.parseInt(value, 10));
+  return {
+    width: { ideal: width },
+    height: { ideal: height },
+    frameRate: { ideal: 30, max: 30 },
+  };
 }
 
 function buildIceServers() {
@@ -180,6 +198,10 @@ function renderMeetingLists(participants, publications, requestedSubscriptions, 
       return bits.join(" • ");
     })
   );
+}
+
+function renderMediaStats(items) {
+  renderSimpleList(el.mediaStatsList, items);
 }
 
 function renderSubscriptionControls(participants, publications, requestedTrackIds) {
@@ -383,10 +405,39 @@ async function setupPeerConnection() {
     log("remote track", { kind: event.track.kind, id: event.track.id });
   });
 
-  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+  localStream = await navigator.mediaDevices.getUserMedia({
+    audio: true,
+    video: getCaptureConstraints(),
+  });
   el.localVideo.srcObject = localStream;
   for (const track of localStream.getTracks()) {
+    if (track.kind === "video" && el.enableSimulcast.checked) {
+      try {
+        pc.addTransceiver(track, {
+          direction: "sendrecv",
+          streams: [localStream],
+          sendEncodings: [
+            { rid: "q", scaleResolutionDownBy: 4.0, maxBitrate: 150_000 },
+            { rid: "h", scaleResolutionDownBy: 2.0, maxBitrate: 500_000 },
+            { rid: "f", scaleResolutionDownBy: 1.0, maxBitrate: 1_500_000 },
+          ],
+        });
+        log("video sender configured", {
+          simulcast: true,
+          rids: ["q", "h", "f"],
+          preset: el.capturePreset.value,
+        });
+        continue;
+      } catch (error) {
+        log("video simulcast setup failed; falling back to single encoding", {
+          error: error.message,
+        });
+      }
+    }
     pc.addTrack(track, localStream);
+    if (track.kind === "video") {
+      log("video sender configured", { simulcast: false, preset: el.capturePreset.value });
+    }
   }
 }
 
@@ -447,10 +498,52 @@ function summarizeSdp(sdp) {
         line.startsWith("m=") ||
         line.startsWith("a=mid:") ||
         line.startsWith("a=setup:") ||
+        line.startsWith("a=rid:") ||
+        line.startsWith("a=simulcast:") ||
+        line.startsWith("a=extmap:") ||
         line.startsWith("a=send") ||
         line.startsWith("a=recv") ||
         line.startsWith("a=rtpmap:")
     );
+}
+
+async function collectMediaStats() {
+  if (!pc) {
+    renderMediaStats([]);
+    return;
+  }
+
+  const stats = await pc.getStats();
+  const items = [];
+  const remoteVideo = document.querySelector('[data-stream-id="remote-main"] video');
+  if (remoteVideo) {
+    const dims = `${remoteVideo.videoWidth || 0}x${remoteVideo.videoHeight || 0}`;
+    items.push(`remote element • size=${dims}`);
+  }
+  for (const report of stats.values()) {
+    if (report.type === "outbound-rtp" && report.kind === "video" && !report.isRemote) {
+      const bits = ["outbound video"];
+      if (report.rid) bits.push(`rid=${report.rid}`);
+      if (report.frameWidth && report.frameHeight) {
+        bits.push(`size=${report.frameWidth}x${report.frameHeight}`);
+      }
+      if (report.framesPerSecond) bits.push(`fps=${report.framesPerSecond}`);
+      if (report.qualityLimitationReason) {
+        bits.push(`limit=${report.qualityLimitationReason}`);
+      }
+      items.push(bits.join(" • "));
+    }
+    if (report.type === "inbound-rtp" && report.kind === "video" && !report.isRemote) {
+      const bits = ["inbound video"];
+      if (report.frameWidth && report.frameHeight) {
+        bits.push(`size=${report.frameWidth}x${report.frameHeight}`);
+      }
+      if (report.framesPerSecond) bits.push(`fps=${report.framesPerSecond}`);
+      if (report.jitter) bits.push(`jitter=${Number(report.jitter).toFixed(4)}`);
+      items.push(bits.join(" • "));
+    }
+  }
+  renderMediaStats(items);
 }
 
 async function syncSubscriptions() {
@@ -503,6 +596,17 @@ async function startDrainLoop() {
     } catch (error) {
       log("drain_ice failed", { error: error.message });
     }
+  }, 1000);
+}
+
+function startStatsLoop() {
+  if (statsTimer) {
+    window.clearInterval(statsTimer);
+  }
+  statsTimer = window.setInterval(() => {
+    collectMediaStats().catch((error) => {
+      log("stats failed", { error: error.message });
+    });
   }, 1000);
 }
 
@@ -578,6 +682,7 @@ async function connect() {
 
   await renegotiate("initial publish");
   await startDrainLoop();
+  startStatsLoop();
   await syncSubscriptions();
   syncTimer = window.setInterval(syncSubscriptions, 2000);
 
@@ -593,6 +698,10 @@ async function leave() {
   if (drainTimer) {
     window.clearInterval(drainTimer);
     drainTimer = null;
+  }
+  if (statsTimer) {
+    window.clearInterval(statsTimer);
+    statsTimer = null;
   }
 
   if (pc) {
@@ -631,6 +740,7 @@ async function leave() {
   selectedPublisherId = null;
   setPolicyMode(null);
   renderMeetingLists([], [], [], [], []);
+  renderMediaStats([]);
   renderSubscriptionControls([], [], []);
   setButtons(false);
   setStatus("Idle");
