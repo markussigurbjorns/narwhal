@@ -1,34 +1,156 @@
-NARWHAL TO DO:
-
-  1. Tune the buffer sizes based on actual bitrate and latency targets.
-  2. Add counters or metrics for dropped RTP so overload is visible in production.
-  3. Decide whether slow subscribers should keep dropping packets or be disconnected after sustained overflow.
-
-1. Relay keyframe feedback only: detect subscriber-side PLI/FIR and trigger a publisher-side keyframe request.
-  2. Add observability first: inspect what feedback webrtcbin/stats expose so we know what to translate.
-  3. Go lower-level: integrate with rtpbin/transceiver hooks instead of pad-level RTP copying.
-
-
-IF a new publisher starts, then we dont know where to send the kayframes
-
-• 1. Run a fresh publish+subscribe and capture server logs around subscribe time.
-  2. Check if join_to_first_rtp_ms is low but join_to_first_video_keyframe_ms is high. If yes, keyframe cadence/request path is the bottleneck.
-  3. Check for dropping RTP ... queue is full. If present, raise queue sizes or drop slow subscribers earlier.
-  4. If keyframe delay is the issue, send periodic FIR/PLI for first 2-3 seconds after subscribe (until first video keyframe seen).
-  5. Add one integration test scenario: subscribe while publisher is already running, assert first media arrival under a target SLA (for example < 1500 ms).
-
-MEETING MODE 
-Execution plan
-
-  1. Introduce room mode + meeting state structs (no behavior change yet).
-  2. Add WS + JSON-RPC plumbing.
-  3. Implement join/leave + ICE + sdp_offer.
-  4. Implement publish_tracks + subscribe/unsubscribe graph.
-  5. Wire renegotiation revisioning + serialization lock.
-  6. Add tests for race cases (simultaneous subscribe/unsubscribe, stale revision).
-
 
 ##### USE #####
 
 NARWHAL_STUN_SERVER='stun://turn.makudoku.com:3478' NARWHAL_TURN_SERVER='turn://testuser:testpassword@turn.makudoku.com:3478?transport=udp' cargo run -p narwhald
 http://localhost:8080/clients/meeting?turn_user=testuser&turn_pass=testpassword
+
+• Priority Order
+
+  If the goal is a production SFU, the next steps are not “add more features”. They are:
+
+  1. make signaling and room lifecycle correct under failure
+  2. make media forwarding observable and backpressure-aware
+  3. make negotiation, subscription changes, and ICE recovery reliable
+  4. harden operations, security, and deployability
+
+  Right now the repo is closer to “working SFU core” than “production SFU product”.
+
+  What To Build Next
+
+  1. Define the product envelope
+     Decide what this SFU is supposed to support in v1:
+
+  - broadcast only, or meetings too
+  - max publishers per room
+  - max subscribers/participants per room
+  - simulcast/SVC required or optional
+  - TURN required or customer-provided
+  - target regions, latency, and bitrate envelope
+
+  Without that, architecture decisions stay fuzzy.
+
+  2. Stabilize signaling semantics
+     Your signaling is still prototype-grade.
+     Needed work:
+
+  - proper error taxonomy: 404, 409, 422, 500, not mostly 400
+  - explicit room/session state machine
+  - idempotent join/leave/stop behavior
+  - stale revision handling with clear retry semantics
+  - server-driven renegotiation model for meeting updates
+  - reconnect and resume story for dropped WebSockets
+
+  This is the first place production bugs will show up.
+
+  3. Add observability before optimization
+     The TODO file is correct here. Before tuning, add:
+
+  - per-room and per-peer counters
+  - RTP in/out packets, bytes, drops
+  - queue depth and overflow counts
+  - subscribe-to-first-media and subscribe-to-first-keyframe latency
+  - ICE state transitions
+  - DTLS/peer connection failures
+  - renegotiation counts and failures
+  - room participant/session churn
+  - structured tracing with room/session IDs
+
+  If you cannot answer “why did this subscriber stall?” from metrics, it is not production-ready.
+
+  4. Harden media backpressure and overload behavior
+     This is the core SFU problem.
+     You need explicit policies for:
+
+  - slow subscriber queues
+  - packet dropping thresholds
+  - disconnecting persistently bad consumers
+  - keyframe request rate limiting
+  - handling publisher bitrate spikes
+  - fairness across subscribers
+
+  Today the code suggests packet fanout exists, but the overload policy is not mature yet.
+
+  5. Finish negotiation and subscription correctness
+     Meeting mode especially needs hardening:
+
+  - serialization around offer/answer
+  - safe concurrent subscribe/unsubscribe/publish/unpublish
+  - renegotiation triggers when forwarding set changes
+  - ICE restart support
+  - consistent MID/RID/SSRC routing under simulcast
+  - cleanup on abandoned sessions and partial failures
+
+  This needs both code work and race-focused tests.
+
+  6. Deep protocol/media compatibility testing
+     A production SFU dies on interoperability, not on happy paths.
+     Test against:
+
+  - Chrome, Firefox, Safari
+  - mobile WebRTC stacks if relevant
+  - VP8/H264 first; add AV1 later if needed
+  - simulcast on/off
+  - TURN-only and UDP-blocked environments
+  - publisher restart while subscribers stay connected
+  - subscriber join while publisher is already live
+  - network loss, reordering, and ICE flaps
+
+  Automate as much of this as possible.
+
+  7. Security and abuse controls
+     Missing from the current shape:
+
+  - authn/authz for publish/subscribe/control APIs
+  - room access control and expiring tokens
+  - rate limiting
+  - payload size limits
+  - WebSocket abuse controls
+  - CORS/origin policy
+  - secret management for TURN and internal control APIs
+
+  An unauthenticated SFU is a public relay.
+
+  8. Operationalize deployment
+     You need a real service envelope:
+
+  - config system instead of hardcoded defaults
+  - health/readiness endpoints
+  - graceful shutdown and draining
+  - container build and runtime docs
+  - kernel/network tuning guidance
+  - log format and log shipping
+  - Prometheus/OpenTelemetry integration
+  - capacity testing and SLOs
+
+  9. Decide scaling architecture
+     Single-node is fine first, but decide early what scales:
+
+  - room-affinity per node
+  - external signaling/control plane or not
+  - sticky routing at load balancer
+  - TURN colocated or separate
+  - per-room sharding model
+  - eventual cascading/relay between nodes if needed
+
+  Most SFUs scale by keeping one room on one node, not by distributing one room arbitrarily.
+
+  Concrete 30-Day Plan
+
+  1. Week 1: observability, error model, health endpoints, config cleanup
+  2. Week 2: backpressure policy, queue/drop metrics, subscriber stall handling
+  3. Week 3: negotiation correctness and race/integration tests
+  4. Week 4: auth tokens, deployable container/service, load test baseline
+
+  What I Would Do First In This Repo
+
+  First, I would implement:
+
+  - Prometheus metrics
+  - structured error mapping in server
+  - explicit room/session state transitions in narwhal-core
+  - integration tests for join/publish/subscribe/reconnect/race cases
+  - overload handling for slow subscribers
+
+  Only after that would I spend time on advanced SFU features like better simulcast policy, active speaker logic, or multi-node scaling.
+
+  If you want, I can turn this into a concrete engineering roadmap against the current codebase, with file-level changes and milestone order.

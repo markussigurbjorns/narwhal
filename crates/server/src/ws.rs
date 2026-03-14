@@ -6,14 +6,20 @@ use axum::{
     response::IntoResponse,
 };
 use narwhal_core::{
-    MeetingPolicyMode, MeetingPublishTrack, MediaKind, RoomId, RoomManager, RoomMode,
+    Error as CoreError, MediaKind, MeetingPolicyMode, MeetingPublishTrack, RoomId, RoomManager,
+    RoomMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-pub async fn ws_upgrade(ws: WebSocketUpgrade, State(rooms): State<RoomManager>) -> impl IntoResponse {
+use crate::errors::TransportError;
+
+pub async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(rooms): State<RoomManager>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, rooms))
 }
 
@@ -147,7 +153,10 @@ struct SetPolicyModeParams {
 }
 
 async fn handle_socket(mut socket: WebSocket, rooms: RoomManager) {
-    let mut state = SessionState { rooms, joined: None };
+    let mut state = SessionState {
+        rooms,
+        joined: None,
+    };
 
     while let Some(msg) = socket.recv().await {
         let Ok(msg) = msg else {
@@ -184,6 +193,7 @@ async fn handle_socket(mut socket: WebSocket, rooms: RoomManager) {
             warn!(
                 participant_id = %joined.participant_id,
                 room = %joined.room.0,
+                cause = TransportError::cause_label_from_anyhow(&err),
                 "meeting ws close cleanup failed: {err:#}"
             );
         } else {
@@ -200,17 +210,17 @@ async fn handle_text(state: &mut SessionState, text: String) -> Option<RpcRespon
     let req = match serde_json::from_str::<RpcRequest>(&text) {
         Ok(v) => v,
         Err(err) => {
-            return Some(error_response(
-                None,
-                -32700,
-                format!("parse error: {err}"),
-            ));
+            return Some(error_response(None, -32700, format!("parse error: {err}")));
         }
     };
 
     let id = req.id.clone();
     if req.jsonrpc != "2.0" {
-        return Some(error_response(id, -32600, "invalid jsonrpc version".to_string()));
+        return Some(error_response(
+            id,
+            -32600,
+            "invalid jsonrpc version".to_string(),
+        ));
     }
 
     let resp = match req.method.as_str() {
@@ -244,10 +254,7 @@ async fn handle_text(state: &mut SessionState, text: String) -> Option<RpcRespon
 
 async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError> {
     if state.joined.is_some() {
-        return Err(rpc_error(
-            4001,
-            "already joined; leave first or reconnect".to_string(),
-        ));
+        return Err(rpc_core_error(CoreError::AlreadyJoined));
     }
 
     let params: JoinParams = serde_json::from_value(params)
@@ -257,21 +264,22 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
     let participant_id = Uuid::new_v4().to_string();
     let revision = match state.rooms.room_mode(&room) {
         Some(RoomMode::Broadcast) => {
-            return Err(rpc_error(
-                4002,
-                "room already used in broadcast mode".to_string(),
+            return Err(rpc_core_error(
+                CoreError::MeetingSignalingUnavailableInBroadcastMode,
             ));
         }
         Some(RoomMode::Meeting) => state
             .rooms
             .meeting_join(room.clone(), participant_id.clone(), params.display_name)
-            .map_err(|err| rpc_error(5001, err.to_string()))?,
+            .map_err(rpc_transport_error)?,
         None => {
-            state.rooms.ensure_room_mode(room.clone(), RoomMode::Meeting);
+            state
+                .rooms
+                .ensure_room_mode(room.clone(), RoomMode::Meeting);
             state
                 .rooms
                 .meeting_join(room.clone(), participant_id.clone(), params.display_name)
-                .map_err(|err| rpc_error(5001, err.to_string()))?
+                .map_err(rpc_transport_error)?
         }
     };
 
@@ -297,14 +305,14 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
 
 async fn leave(state: &mut SessionState) -> Result<Value, RpcError> {
     let Some(joined) = state.joined.take() else {
-        return Err(rpc_error(4003, "not joined".to_string()));
+        return Err(rpc_core_error(CoreError::NotJoined));
     };
 
     state
         .rooms
         .meeting_leave(joined.room.clone(), &joined.participant_id)
         .await
-        .map_err(|err| rpc_error(5002, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     info!(
         participant_id = %joined.participant_id,
@@ -321,7 +329,7 @@ async fn sdp_offer(state: &mut SessionState, params: Value) -> Result<Value, Rpc
     let joined = state
         .joined
         .as_mut()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: SdpOfferParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for sdp_offer: {err}")))?;
 
@@ -334,7 +342,7 @@ async fn sdp_offer(state: &mut SessionState, params: Value) -> Result<Value, Rpc
             params.offer_sdp,
         )
         .await
-        .map_err(|err| rpc_error(4090, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     joined.revision = answer.revision;
 
@@ -348,7 +356,7 @@ async fn trickle_ice(state: &mut SessionState, params: Value) -> Result<Value, R
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: TrickleIceParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for trickle_ice: {err}")))?;
 
@@ -361,7 +369,7 @@ async fn trickle_ice(state: &mut SessionState, params: Value) -> Result<Value, R
             params.candidate,
         )
         .await
-        .map_err(|err| rpc_error(4091, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({ "ok": true }))
 }
@@ -370,14 +378,14 @@ async fn drain_ice(state: &mut SessionState, params: Value) -> Result<Value, Rpc
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: DrainIceParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for drain_ice: {err}")))?;
 
     let list = state
         .rooms
         .meeting_drain_ice(joined.room.clone(), &joined.participant_id, params.max)
-        .map_err(|err| rpc_error(4092, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({
         "candidates": list
@@ -391,7 +399,7 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
     let joined = state
         .joined
         .as_mut()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: PublishTracksParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for publish_tracks: {err}")))?;
     let tracks = params
@@ -407,7 +415,7 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
     let revision = state
         .rooms
         .meeting_publish_tracks(joined.room.clone(), &joined.participant_id, tracks)
-        .map_err(|err| rpc_error(4093, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
     joined.revision = revision;
 
     Ok(json!({
@@ -420,14 +428,22 @@ async fn unpublish_tracks(state: &mut SessionState, params: Value) -> Result<Val
     let joined = state
         .joined
         .as_mut()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
-    let params: TrackIdsParams = serde_json::from_value(params)
-        .map_err(|err| rpc_error(-32602, format!("invalid params for unpublish_tracks: {err}")))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
+    let params: TrackIdsParams = serde_json::from_value(params).map_err(|err| {
+        rpc_error(
+            -32602,
+            format!("invalid params for unpublish_tracks: {err}"),
+        )
+    })?;
 
     let revision = state
         .rooms
-        .meeting_unpublish_tracks(joined.room.clone(), &joined.participant_id, params.track_ids)
-        .map_err(|err| rpc_error(4094, err.to_string()))?;
+        .meeting_unpublish_tracks(
+            joined.room.clone(),
+            &joined.participant_id,
+            params.track_ids,
+        )
+        .map_err(rpc_transport_error)?;
     joined.revision = revision;
 
     Ok(json!({
@@ -440,14 +456,18 @@ async fn subscribe(state: &mut SessionState, params: Value) -> Result<Value, Rpc
     let joined = state
         .joined
         .as_mut()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: TrackIdsParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for subscribe: {err}")))?;
 
     let revision = state
         .rooms
-        .meeting_subscribe(joined.room.clone(), &joined.participant_id, params.track_ids)
-        .map_err(|err| rpc_error(4095, err.to_string()))?;
+        .meeting_subscribe(
+            joined.room.clone(),
+            &joined.participant_id,
+            params.track_ids,
+        )
+        .map_err(rpc_transport_error)?;
     joined.revision = revision;
 
     Ok(json!({
@@ -460,14 +480,18 @@ async fn unsubscribe(state: &mut SessionState, params: Value) -> Result<Value, R
     let joined = state
         .joined
         .as_mut()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: TrackIdsParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for unsubscribe: {err}")))?;
 
     let revision = state
         .rooms
-        .meeting_unsubscribe(joined.room.clone(), &joined.participant_id, params.track_ids)
-        .map_err(|err| rpc_error(4096, err.to_string()))?;
+        .meeting_unsubscribe(
+            joined.room.clone(),
+            &joined.participant_id,
+            params.track_ids,
+        )
+        .map_err(rpc_transport_error)?;
     joined.revision = revision;
 
     Ok(json!({
@@ -480,12 +504,12 @@ async fn list_publications(state: &mut SessionState) -> Result<Value, RpcError> 
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
 
     let list = state
         .rooms
         .meeting_list_publications(joined.room.clone())
-        .map_err(|err| rpc_error(4097, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({
         "publications": list
@@ -509,12 +533,12 @@ async fn list_streams(state: &mut SessionState) -> Result<Value, RpcError> {
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
 
     let list = state
         .rooms
         .meeting_list_streams(joined.room.clone())
-        .map_err(|err| rpc_error(4102, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({
         "streams": list
@@ -542,12 +566,12 @@ async fn list_participants(state: &mut SessionState) -> Result<Value, RpcError> 
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
 
     let list = state
         .rooms
         .meeting_list_participants(joined.room.clone())
-        .map_err(|err| rpc_error(4099, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({
         "participants": list
@@ -566,16 +590,16 @@ async fn list_subscriptions(state: &mut SessionState) -> Result<Value, RpcError>
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
 
     let requested_track_ids = state
         .rooms
         .meeting_list_subscription_requests(joined.room.clone(), &joined.participant_id)
-        .map_err(|err| rpc_error(4098, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
     let effective_track_ids = state
         .rooms
         .meeting_list_effective_subscriptions(joined.room.clone(), &joined.participant_id)
-        .map_err(|err| rpc_error(4098, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({
         "requested_track_ids": requested_track_ids,
@@ -588,12 +612,12 @@ async fn get_policy_mode(state: &mut SessionState) -> Result<Value, RpcError> {
     let joined = state
         .joined
         .as_ref()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
 
     let mode = state
         .rooms
         .meeting_policy_mode(joined.room.clone())
-        .map_err(|err| rpc_error(4100, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
 
     Ok(json!({
         "mode": policy_mode_label(mode)
@@ -604,7 +628,7 @@ async fn set_policy_mode(state: &mut SessionState, params: Value) -> Result<Valu
     let joined = state
         .joined
         .as_mut()
-        .ok_or_else(|| rpc_error(4003, "not joined".to_string()))?;
+        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: SetPolicyModeParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for set_policy_mode: {err}")))?;
 
@@ -612,7 +636,7 @@ async fn set_policy_mode(state: &mut SessionState, params: Value) -> Result<Valu
     let revision = state
         .rooms
         .meeting_set_policy_mode(joined.room.clone(), mode)
-        .map_err(|err| rpc_error(4101, err.to_string()))?;
+        .map_err(rpc_transport_error)?;
     joined.revision = revision;
 
     Ok(json!({
@@ -642,4 +666,88 @@ fn error_response(id: Option<Value>, code: i32, message: String) -> RpcResponse 
 
 fn rpc_error(code: i32, message: String) -> RpcError {
     RpcError { code, message }
+}
+
+fn rpc_transport_error(err: anyhow::Error) -> RpcError {
+    let err = TransportError::from_anyhow(err);
+    rpc_error(err.rpc_code(), err.message)
+}
+
+fn rpc_core_error(err: CoreError) -> RpcError {
+    rpc_transport_error(err.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JoinedParticipant, SessionState, handle_text, join, leave};
+    use media::GstRuntime;
+    use narwhal_core::{RoomId, RoomManager};
+    use serde_json::json;
+
+    fn manager() -> RoomManager {
+        let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
+        RoomManager::new(gst)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn join_rejects_when_session_already_joined() {
+        let mut state = SessionState {
+            rooms: manager(),
+            joined: Some(JoinedParticipant {
+                room: RoomId("room-a".to_string()),
+                participant_id: "participant-a".to_string(),
+                revision: 1,
+            }),
+        };
+
+        let err = join(
+            &mut state,
+            json!({
+                "room": "room-b",
+                "display_name": "Bob"
+            }),
+        )
+        .await
+        .expect_err("join should fail");
+
+        assert_eq!(err.code, 4090);
+        assert_eq!(err.message, "already joined; leave first or reconnect");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn leave_requires_joined_session() {
+        let mut state = SessionState {
+            rooms: manager(),
+            joined: None,
+        };
+
+        let err = leave(&mut state).await.expect_err("leave should fail");
+        assert_eq!(err.code, 4220);
+        assert_eq!(err.message, "not joined");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_text_maps_not_joined_rpc_error() {
+        let mut state = SessionState {
+            rooms: manager(),
+            joined: None,
+        };
+
+        let response = handle_text(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "leave",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .await
+        .expect("response expected");
+
+        let error = response.error.expect("rpc error expected");
+        assert_eq!(error.code, 4220);
+        assert_eq!(error.message, "not joined");
+    }
 }

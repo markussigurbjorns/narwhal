@@ -151,7 +151,8 @@ where
                     mid: publication.mid.clone(),
                 }),
                 MediaKind::Video => {
-                    let Some(target) = select_video_target(subscriber_plan.video.len(), publication)
+                    let Some(target) =
+                        select_video_target(subscriber_plan.video.len(), publication)
                     else {
                         continue;
                     };
@@ -191,11 +192,14 @@ pub struct LowBandwidthPolicy;
 
 impl PolicyEngine for LowBandwidthPolicy {
     fn build_plan(&self, facts: &RoomFacts) -> SubscriptionPlan {
-        build_requested_track_plan(facts, |selected_videos, _publication| match selected_videos {
-            0 => Some(VideoTarget::High),
-            1 | 2 => Some(VideoTarget::Low),
-            _ => None,
-        })
+        build_requested_track_plan(
+            facts,
+            |selected_videos, _publication| match selected_videos {
+                0 => Some(VideoTarget::High),
+                1 | 2 => Some(VideoTarget::Low),
+                _ => None,
+            },
+        )
     }
 }
 
@@ -487,7 +491,12 @@ mod tests {
 
         assert_eq!(
             effective_ids,
-            vec!["alice-audio", "alice-video-1", "alice-video-2", "alice-video-3",]
+            vec![
+                "alice-audio",
+                "alice-video-1",
+                "alice-video-2",
+                "alice-video-3",
+            ]
         );
         let video_targets = plan
             .per_subscriber
@@ -565,7 +574,9 @@ mod tests {
             vec![track_id("__broadcast_audio"), track_id("__broadcast_video")]
         );
         assert_eq!(
-            plan.track_subscribers.get(&track_id("__broadcast_video")).map(Vec::len),
+            plan.track_subscribers
+                .get(&track_id("__broadcast_video"))
+                .map(Vec::len),
             Some(2)
         );
     }
@@ -606,8 +617,10 @@ mod tests {
             .expect("subscriber plan");
         assert!(subscriber.video.is_empty());
         assert_eq!(subscriber.audio.len(), 1);
-        assert!(!plan
-            .track_subscribers
-            .contains_key(&track_id("__broadcast_video")));
+        assert!(
+            !plan
+                .track_subscribers
+                .contains_key(&track_id("__broadcast_video"))
+        );
     }
 }

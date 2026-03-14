@@ -162,93 +162,95 @@ pub fn install_rtp_injector(
     >::new()));
     let map2 = map.clone();
 
-    let make_src = move
-        |pipeline: &gst::Pipeline, webrtcbin: &gst::Element, name: &str| -> gst_app::AppSrc {
-            let appsrc_el = gst::ElementFactory::make("appsrc")
-                .name(&format!("rtp_in.{name}"))
-                .build()
-                .expect("appsrc create failed");
-            let appsrc = appsrc_el
-                .downcast::<gst_app::AppSrc>()
-                .expect("appsrc downcast failed");
-            appsrc.set_property("is-live", &true);
-            appsrc.set_property("format", &gst::Format::Time);
-            // Use local pipeline time for forwarded RTP so a late-joining subscriber
-            // does not inherit the publisher pipeline running-time and stall playback.
-            appsrc.set_property("do-timestamp", &true);
-            pipeline.add(appsrc.upcast_ref::<gst::Element>()).ok();
-            appsrc
-                .upcast_ref::<gst::Element>()
-                .sync_state_with_parent()
-                .ok();
+    let make_src = move |pipeline: &gst::Pipeline,
+                         webrtcbin: &gst::Element,
+                         name: &str|
+          -> gst_app::AppSrc {
+        let appsrc_el = gst::ElementFactory::make("appsrc")
+            .name(&format!("rtp_in.{name}"))
+            .build()
+            .expect("appsrc create failed");
+        let appsrc = appsrc_el
+            .downcast::<gst_app::AppSrc>()
+            .expect("appsrc downcast failed");
+        appsrc.set_property("is-live", &true);
+        appsrc.set_property("format", &gst::Format::Time);
+        // Use local pipeline time for forwarded RTP so a late-joining subscriber
+        // does not inherit the publisher pipeline running-time and stall playback.
+        appsrc.set_property("do-timestamp", &true);
+        pipeline.add(appsrc.upcast_ref::<gst::Element>()).ok();
+        appsrc
+            .upcast_ref::<gst::Element>()
+            .sync_state_with_parent()
+            .ok();
 
-            let preferred_pad = match name {
-                "audio" => Some("sink_0"),
-                "video" => Some("sink_1"),
-                _ => None,
-            };
-            let sinkpad = preferred_pad
-                .and_then(|pad_name| find_unlinked_pad_by_name(webrtcbin, pad_name))
-                .or_else(|| {
-                    preferred_pad.and_then(|pad_name| {
-                        // Avoid requesting a named sink pad that already exists.
-                        // GStreamer warns that behavior is undefined in that case.
-                        if find_any_pad_by_name(webrtcbin, pad_name).is_none() {
-                            webrtcbin.request_pad_simple(pad_name)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .or_else(|| webrtcbin.request_pad_simple("sink_%u"));
-            let Some(sinkpad) = sinkpad else {
-                warn!(
-                    media_key = %name,
-                    "failed to request webrtcbin sink pad; dropping stream injection for this key"
-                );
-                return appsrc;
-            };
-            let Some(srcpad) = appsrc.static_pad("src") else {
-                warn!(
-                    media_key = %name,
-                    "appsrc has no static src pad; dropping stream injection for this key"
-                );
-                return appsrc;
-            };
-            if name == "video" {
-                if let Some(on_video_keyframe_request) = on_video_keyframe_request.clone() {
-                    srcpad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
-                        if info
-                            .event()
-                            .is_some_and(|event| event.has_name("GstForceKeyUnit"))
-                        {
-                            on_video_keyframe_request();
-                        }
-                        gst::PadProbeReturn::Ok
-                    });
-                }
-            }
-            if srcpad.link(&sinkpad).is_err() {
-                // Some layouts expose sink_0/sink_1 but they are already occupied or otherwise unusable.
-                // Retry with a newly requested sink_%u before giving up.
-                let retry_sink = webrtcbin.request_pad_simple("sink_%u");
-                if let Some(retry_sink) = retry_sink {
-                    if srcpad.link(&retry_sink).is_err() {
-                        warn!(
-                            media_key = %name,
-                            "failed to link appsrc to webrtcbin sink pad; dropping stream injection for this key"
-                        );
+        let preferred_pad = match name {
+            "audio" => Some("sink_0"),
+            "video" => Some("sink_1"),
+            _ => None,
+        };
+        let sinkpad = preferred_pad
+            .and_then(|pad_name| find_unlinked_pad_by_name(webrtcbin, pad_name))
+            .or_else(|| {
+                preferred_pad.and_then(|pad_name| {
+                    // Avoid requesting a named sink pad that already exists.
+                    // GStreamer warns that behavior is undefined in that case.
+                    if find_any_pad_by_name(webrtcbin, pad_name).is_none() {
+                        webrtcbin.request_pad_simple(pad_name)
+                    } else {
+                        None
                     }
-                } else {
+                })
+            })
+            .or_else(|| webrtcbin.request_pad_simple("sink_%u"));
+        let Some(sinkpad) = sinkpad else {
+            warn!(
+                media_key = %name,
+                "failed to request webrtcbin sink pad; dropping stream injection for this key"
+            );
+            return appsrc;
+        };
+        let Some(srcpad) = appsrc.static_pad("src") else {
+            warn!(
+                media_key = %name,
+                "appsrc has no static src pad; dropping stream injection for this key"
+            );
+            return appsrc;
+        };
+        if name == "video" {
+            if let Some(on_video_keyframe_request) = on_video_keyframe_request.clone() {
+                srcpad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                    if info
+                        .event()
+                        .is_some_and(|event| event.has_name("GstForceKeyUnit"))
+                    {
+                        on_video_keyframe_request();
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+        }
+        if srcpad.link(&sinkpad).is_err() {
+            // Some layouts expose sink_0/sink_1 but they are already occupied or otherwise unusable.
+            // Retry with a newly requested sink_%u before giving up.
+            let retry_sink = webrtcbin.request_pad_simple("sink_%u");
+            if let Some(retry_sink) = retry_sink {
+                if srcpad.link(&retry_sink).is_err() {
                     warn!(
                         media_key = %name,
                         "failed to link appsrc to webrtcbin sink pad; dropping stream injection for this key"
                     );
                 }
+            } else {
+                warn!(
+                    media_key = %name,
+                    "failed to link appsrc to webrtcbin sink pad; dropping stream injection for this key"
+                );
             }
+        }
 
-            appsrc
-        };
+        appsrc
+    };
 
     initial_streams.sort_by_key(|stream| match stream.media_key.as_str() {
         "audio" => 0,

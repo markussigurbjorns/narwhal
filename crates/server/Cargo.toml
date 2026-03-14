@@ -13,3 +13,8 @@ tracing = "0.1.44"
 uuid = { version = "1.21.0", features = ["v4"] }
 
 narwhal-core = { path = "../narwhal-core" }
+
+[dev-dependencies]
+media = { path = "../media" }
+tokio = { version = "1.49.0", features = ["macros", "rt"] }
+tower = { version = "0.5.2", features = ["util"] }

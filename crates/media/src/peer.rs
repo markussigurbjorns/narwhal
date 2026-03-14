@@ -704,9 +704,7 @@ impl PeerSession {
         let pipeline = self.inner.pipeline.clone();
         let webrtcbin = self.inner.webrtcbin.clone();
         self.gst
-            .exec(move || {
-                crate::install_rtp_injector(&pipeline, &webrtcbin, initial_streams, None)
-            })
+            .exec(move || crate::install_rtp_injector(&pipeline, &webrtcbin, initial_streams, None))
             .await
     }
 }
@@ -845,24 +843,15 @@ fn inactive_media_sections(sdp: &str) -> Vec<String> {
 
 fn find_video_src_pad(webrtcbin: &gst::Element) -> Option<gst::Pad> {
     webrtcbin.src_pads().into_iter().find(|pad| {
-        pad.current_caps()
-            .as_ref()
-            .is_some_and(is_video_rtp_caps)
-            || pad
-                .allowed_caps()
-                .as_ref()
-                .is_some_and(is_video_rtp_caps)
+        pad.current_caps().as_ref().is_some_and(is_video_rtp_caps)
+            || pad.allowed_caps().as_ref().is_some_and(is_video_rtp_caps)
     })
 }
 
 fn is_video_rtp_caps(caps: &gst::Caps) -> bool {
     caps.structure(0).is_some_and(|s| {
         s.name() == "application/x-rtp"
-            && s.get_optional::<String>("media")
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("video")
+            && s.get_optional::<String>("media").ok().flatten().as_deref() == Some("video")
     })
 }
 

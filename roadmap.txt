@@ -1,0 +1,298 @@
+• Roadmap
+
+  This repo should be pushed to production in phases. The right sequence is: correctness, observability, overload control, interoperability, security, then scaling.
+
+  Phase 0: Define The V1 Envelope
+
+  Before touching code, lock these decisions:
+
+  - Broadcast only vs meetings plus broadcast
+  - Room size targets: publishers, subscribers, meeting participants
+  - Codec support for v1: likely Opus + VP8/H264
+  - Simulcast required or optional
+  - Single-region single-node first, with room affinity per node
+  - Authentication model for publishers, subscribers, and control APIs
+
+  Deliverable:
+
+  - short docs/v1-scope.md with supported limits and explicit non-goals
+
+  Why first:
+
+  - it determines whether current abstractions are sufficient or whether the meeting path needs redesign now
+
+  Phase 1: Stabilize Signaling And State
+
+  Main code areas:
+
+  - crates/server/src/lib.rs
+  - crates/server/src/ws.rs
+  - crates/narwhal-core/src/room.rs
+
+  Goals:
+
+  - formal room/session state machine
+  - proper HTTP/WS error mapping
+  - idempotent cleanup
+  - consistent renegotiation semantics
+  - stale revision handling that clients can recover from
+
+  Work:
+
+  - replace generic 400 responses with structured mapping: 404, 409, 422, 500
+  - define explicit states for broadcast publisher, broadcast subscriber, meeting participant peer
+  - make leave, stop, and disconnect cleanup safe if called twice
+  - document and enforce revision contract for meeting updates
+  - separate “client requested change” from “server requires renegotiation”
+
+  Deliverables:
+
+  - docs/signaling.md
+  - shared error type in server
+  - room/session state tests in narwhal-core
+
+  Exit criteria:
+
+  - no ambiguous signaling behavior during join/leave/reconnect/publish/unpublish races
+
+  Phase 2: Add Production Observability
+
+  Main code areas:
+
+  - crates/narwhal-core/src/room.rs
+  - crates/media/src/peer.rs
+  - bins/narwhald/src/main.rs
+
+  Goals:
+
+  - understand failures before tuning behavior
+  - expose media and signaling health per room and peer
+
+  Metrics to add:
+
+  - rooms active by mode
+  - peers active by role
+  - join/leave/publish/subscribe counters
+  - ICE candidate in/out counts
+  - ICE connected/failed transitions
+  - SDP offer/answer failures
+  - RTP packets in/out
+  - RTP packets dropped by reason
+  - queue depth and queue overflow counts
+  - time from subscribe to first RTP
+  - time from subscribe to first video keyframe
+  - renegotiation count and failure count
+
+  Work:
+
+  - add metrics crate and exporter endpoint
+  - add structured tracing fields: room id, participant id, peer id, track id
+  - emit lifecycle spans around negotiation and forwarding
+  - add lightweight periodic state snapshots for debugging
+
+  Deliverables:
+
+  - /metrics endpoint
+  - dashboards for room health and media health
+  - alert rules for peer failures, queue overflow, and zero-media sessions
+
+  Exit criteria:
+
+  - you can explain a stalled subscriber from logs and metrics alone
+
+  Phase 3: Backpressure And Overload Control
+
+  Main code areas:
+
+  - crates/media/src/rtp.rs
+  - crates/narwhal-core/src/room.rs
+  - TODO context in NARWHAL TO DO.txt
+
+  Goals:
+
+  - make slow subscribers degrade predictably instead of poisoning the room
+
+  Work:
+
+  - define bounded queues and explicit overflow policy
+  - count drops separately for audio, video delta, video keyframe
+  - rate-limit keyframe requests
+  - implement disconnect policy for sustained slow consumers
+  - prefer dropping lower-priority video before audio
+  - add policy knobs: queue size, overflow duration, disconnect threshold
+
+  Deliverables:
+
+  - overload policy document
+  - metrics by drop reason
+  - tested slow-subscriber behavior
+
+  Exit criteria:
+
+  - one bad subscriber cannot destabilize the room
+
+  Phase 4: Negotiation And Media Correctness
+
+  Main code areas:
+
+  - crates/server/src/ws.rs
+  - crates/narwhal-core/src/room.rs
+  - crates/media/src/peer.rs
+
+  Goals:
+
+  - make meeting mode reliable under real browser behavior
+
+  Work:
+
+  - serialize renegotiation per peer
+  - make server-driven renegotiation explicit
+  - finish ICE restart handling
+  - validate MID/RID/SSRC routing under simulcast
+  - ensure subscription changes become effective without desync
+  - handle publisher restart while subscribers remain connected
+  - handle joining mid-stream and keyframe warmup robustly
+
+  Tests to add:
+
+  - simultaneous subscribe/unsubscribe from multiple peers
+  - stale revision rejection and recovery
+  - disconnect during negotiation
+  - reconnect after WebSocket loss
+  - join while publisher already active
+  - publisher replace/restart case
+  - TURN-only connectivity case
+
+  Deliverables:
+
+  - integration tests, not just unit tests
+  - meeting negotiation state diagram
+  - zero known desync cases in happy-path browsers
+
+  Exit criteria:
+
+  - Chrome/Firefox/Safari can join, subscribe, renegotiate, and recover reliably
+
+  Phase 5: Security And Access Control
+
+  Main code areas:
+
+  - crates/server/src/lib.rs
+  - crates/server/src/ws.rs
+  - bins/narwhald/src/main.rs
+
+  Goals:
+
+  - prevent the SFU from being an open relay or an easy abuse target
+
+  Work:
+
+  - signed room tokens for publish/subscribe/join/control
+  - origin checks for WebSocket and browser endpoints
+  - rate limits by IP and token
+  - request body size limits
+  - time-limited session authorization
+  - isolate control endpoints from public media endpoints
+  - audit logs for room access and policy changes
+
+  Deliverables:
+
+  - auth design doc
+  - middleware for token validation and rate limiting
+  - secured control plane
+
+  Exit criteria:
+
+  - anonymous users cannot publish, join, or inspect rooms
+
+  Phase 6: Deployment Hardening
+
+  Main code areas:
+
+  - bins/narwhald/src/main.rs
+  - config usage in browser demo files should be treated as non-production
+
+  Goals:
+
+  - make the service operable as a real daemon
+
+  Work:
+
+  - config file/env model for ports, TURN, limits, timeouts, metrics
+  - health and readiness endpoints
+  - graceful shutdown with room draining
+  - container image and systemd/Kubernetes examples
+  - log formatting and log shipping guidance
+  - TLS termination assumptions documented
+  - host tuning guidance: UDP buffers, file descriptors, conntrack, CPU pinning if needed
+
+  Deliverables:
+
+  - docs/deploy.md
+  - docs/config.md
+  - health endpoints and shutdown handling
+
+  Exit criteria:
+
+  - repeatable deploy in staging with no manual tribal knowledge
+
+  Phase 7: Load Testing And Capacity Model
+
+  Goals:
+
+  - find the real bottlenecks before production traffic does
+
+  Work:
+
+  - build reproducible load scenarios for broadcast and meeting modes
+  - measure CPU, memory, bandwidth, queue pressure, packet drops
+  - capture bitrate envelopes for 10, 50, 100, 500 participants depending on scope
+  - derive admission control thresholds
+  - define SLOs for join success, first media latency, and session stability
+
+  Deliverables:
+
+  - load test harness
+  - capacity report per node type
+  - production limits enforced in config
+
+  Exit criteria:
+
+  - you know how many rooms and peers a node can safely hold
+
+  Phase 8: Multi-Node Scaling
+
+  Do this only after single-node behavior is solid.
+
+  Goals:
+
+  - scale by room affinity, not by distributing one room across nodes initially
+
+  Work:
+
+  - add room placement strategy
+  - sticky routing from signaling to media node
+  - external control plane for room lookup
+  - node liveness and draining
+  - optional future cascaded SFU design for very large rooms
+
+  Deliverables:
+
+  - room allocation service or simple coordinator
+  - node registration and draining protocol
+  - documented scaling architecture
+
+  Exit criteria:
+
+  - rooms can be placed, drained, and rebalanced safely across nodes
+
+  Suggested Milestones
+
+  1. M1: signaling correctness + state machine + tests
+  2. M2: metrics + traces + health endpoints
+  3. M3: overload control + slow-subscriber policy
+  4. M4: negotiation reliability + browser interoperability
+  5. M5: auth + rate limiting + secured control APIs
+  6. M6: deployable staging stack + load test baseline
+  7. M7: production launch on single-node room affinity
+  8. M8: multi-node control plane

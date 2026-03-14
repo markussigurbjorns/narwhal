@@ -6,11 +6,13 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 parking_lot = "0.12.5"
+thiserror = "1.0.69"
 tokio = { version = "1.49.0", features = ["sync", "rt", "macros", "time"] }
 uuid = { version = "1.21.0", features = ["v4"] }
 tracing = "0.1.44"
 
 media = { path = "../media" }
+prometheus = "0.14.0"
 
 [dev-dependencies]
 bytes = "1.11.1"

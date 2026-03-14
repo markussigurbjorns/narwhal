@@ -90,7 +90,7 @@ mod tests {
         VideoTarget,
     };
 
-    use super::{compile_forwarding_graph, ForwardingGraph, ForwardingKind, VideoForwarding};
+    use super::{ForwardingGraph, ForwardingKind, VideoForwarding, compile_forwarding_graph};
 
     fn participant_id(id: &str) -> ParticipantId {
         ParticipantId(id.to_string())

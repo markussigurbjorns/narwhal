@@ -1,13 +1,21 @@
 use crate::{
-    BroadcastFacts, BroadcastPolicyMode, ForwardingGraph, ForwardingKind, IceQueue,
-    MeetingParticipantSession, MeetingPolicyMode, MeetingRoomState, MidRoutingInfo, ParticipantId,
-    ParticipantState, PublisherSession, RoomFacts, RoomMode, SubscriberSession, SubscriptionPlan,
-    VideoForwarding, compile_forwarding_graph, start_ice_collector,
+    AppMetrics, BroadcastFacts, BroadcastPolicyMode, Error, ForwardingGraph, ForwardingKind,
+    IceQueue, MeetingParticipantSession, MeetingPolicyMode, MeetingRoomState, MidRoutingInfo,
+    ParticipantId, ParticipantState, PublisherSession, RoomFacts, RoomMode, StateSnapshot,
+    SubscriberSession, SubscriptionPlan, VideoForwarding, compile_forwarding_graph,
+    start_ice_collector,
 };
 use anyhow::Result;
-use media::{GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket, RtpStreamInfo, stream_info};
+use media::{
+    GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket, RtpStreamInfo,
+    is_probable_video_keyframe, stream_info,
+};
 use parking_lot::RwLock;
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, sleep};
@@ -91,6 +99,7 @@ pub struct MeetingStreamInfo {
 #[derive(Clone)]
 pub struct RoomManager {
     gst: GstRuntime,
+    metrics: AppMetrics,
     inner: Arc<RwLock<Rooms>>,
 }
 
@@ -112,18 +121,27 @@ struct RoomState {
     meeting_graph: ForwardingGraph,
     meeting_streams: HashMap<crate::TrackId, HashMap<u32, MeetingStreamInfo>>,
     meeting_route_log_once: HashSet<String>,
+    meeting_joined_at: HashMap<String, Instant>,
 }
 
 struct RoomPeerEvents {
     rooms: RoomManager,
     room: RoomId,
     tokio_handle: Handle,
+    metrics: AppMetrics,
+    role: PeerRole,
 }
 
 impl PeerEvents for RoomPeerEvents {
-    fn on_state(&self, _peer_id: &String, _state: PeerState) {}
+    fn on_state(&self, _peer_id: &String, state: PeerState) {
+        self.metrics
+            .observe_peer_state(peer_role_label(self.role), peer_state_label(state));
+    }
 
     fn on_keyframe_request(&self, _peer_id: &String) {
+        if !matches!(self.role, PeerRole::WhepSubscriber) {
+            return;
+        }
         let rooms = self.rooms.clone();
         let room = self.room.clone();
         self.tokio_handle.spawn(async move {
@@ -138,10 +156,39 @@ impl RoomManager {
     pub fn new(gst: GstRuntime) -> Self {
         Self {
             gst,
+            metrics: AppMetrics::default(),
             inner: Arc::new(RwLock::new(Rooms {
                 rooms: HashMap::new(),
             })),
         }
+    }
+
+    pub fn render_metrics(&self) -> String {
+        self.metrics.render_prometheus(self.state_snapshot())
+    }
+
+    fn state_snapshot(&self) -> StateSnapshot {
+        let g = self.inner.read();
+        let mut snapshot = StateSnapshot {
+            rooms_total: g.rooms.len() as u64,
+            ..StateSnapshot::default()
+        };
+
+        for room in g.rooms.values() {
+            match room.mode {
+                RoomMode::Broadcast => snapshot.rooms_broadcast += 1,
+                RoomMode::Meeting => snapshot.rooms_meeting += 1,
+            }
+
+            if room.publisher.is_some() {
+                snapshot.broadcast_publishers_active += 1;
+            }
+            snapshot.broadcast_subscribers_active += room.subscribers.len() as u64;
+            snapshot.meeting_participants_active += room.meeting.participants.len() as u64;
+            snapshot.meeting_publications_active += room.meeting.publications.len() as u64;
+        }
+
+        snapshot
     }
 
     pub fn room_mode(&self, room: &RoomId) -> Option<RoomMode> {
@@ -173,6 +220,7 @@ impl RoomManager {
                 meeting_graph: ForwardingGraph::default(),
                 meeting_streams: HashMap::new(),
                 meeting_route_log_once: HashSet::new(),
+                meeting_joined_at: HashMap::new(),
             })
     }
 
@@ -203,20 +251,14 @@ impl RoomManager {
 
     pub fn meeting_policy_mode(&self, room: RoomId) -> Result<MeetingPolicyMode> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
         Ok(rs.meeting.policy_mode)
     }
 
     pub fn broadcast_policy_mode(&self, room: RoomId) -> Result<BroadcastPolicyMode> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_broadcast_mode(rs)?;
         Ok(rs.broadcast_policy_mode)
     }
@@ -227,10 +269,7 @@ impl RoomManager {
         policy_mode: BroadcastPolicyMode,
     ) -> Result<()> {
         let mut g = self.inner.write();
-        let rs = g
-            .rooms
-            .get_mut(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_broadcast_mode(rs)?;
         rs.broadcast_policy_mode = policy_mode;
         Self::recompute_broadcast_graph(rs);
@@ -243,10 +282,7 @@ impl RoomManager {
         policy_mode: MeetingPolicyMode,
     ) -> Result<u64> {
         let mut g = self.inner.write();
-        let rs = g
-            .rooms
-            .get_mut(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
         rs.meeting.policy_mode = policy_mode;
         let revision = rs.meeting.next_revision();
@@ -261,18 +297,14 @@ impl RoomManager {
                 let _meeting_revision = rs.meeting.revision;
                 Ok(())
             }
-            RoomMode::Meeting => Err(anyhow::anyhow!(
-                "room is in meeting mode; WHIP/WHEP broadcast endpoints are not available"
-            )),
+            RoomMode::Meeting => Err(broadcast_endpoints_unavailable_in_meeting_mode()),
         }
     }
 
     fn require_meeting_mode(rs: &RoomState) -> Result<()> {
         match rs.mode {
             RoomMode::Meeting => Ok(()),
-            RoomMode::Broadcast => Err(anyhow::anyhow!(
-                "room is in broadcast mode; meeting websocket signaling is not available"
-            )),
+            RoomMode::Broadcast => Err(meeting_signaling_unavailable_in_broadcast_mode()),
         }
     }
 
@@ -287,9 +319,7 @@ impl RoomManager {
         if matches!(rs.mode, RoomMode::Broadcast)
             && (!rs.subscribers.is_empty() || rs.publisher.is_some())
         {
-            return Err(anyhow::anyhow!(
-                "room already active in broadcast mode and cannot switch to meeting mode"
-            ));
+            return Err(room_already_active_in_broadcast_mode());
         }
         rs.mode = RoomMode::Meeting;
         Self::require_meeting_mode(rs)?;
@@ -299,11 +329,15 @@ impl RoomManager {
             .participants
             .entry(pid.clone())
             .or_insert(ParticipantState {
-                id: pid,
+                id: pid.clone(),
                 display_name,
             });
+        rs.meeting_joined_at
+            .entry(pid.0.clone())
+            .or_insert_with(Instant::now);
         let rev = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        self.metrics.inc_meeting_joins();
         Ok(rev)
     }
 
@@ -314,17 +348,15 @@ impl RoomManager {
         tracks: Vec<MeetingPublishTrack>,
     ) -> Result<u64> {
         let mut g = self.inner.write();
-        let rs = g
-            .rooms
-            .get_mut(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let pid = ParticipantId(participant_id.to_string());
         if !rs.meeting.participants.contains_key(&pid) {
-            return Err(anyhow::anyhow!("participant not joined"));
+            return Err(participant_not_joined());
         }
 
+        let track_count = tracks.len() as u64;
         for track in tracks {
             let tid = crate::TrackId(track.track_id);
             rs.meeting.publications.insert(
@@ -340,6 +372,7 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        self.metrics.add_meeting_publish_tracks(track_count);
         Ok(revision)
     }
 
@@ -350,24 +383,20 @@ impl RoomManager {
         track_ids: Vec<String>,
     ) -> Result<u64> {
         let mut g = self.inner.write();
-        let rs = g
-            .rooms
-            .get_mut(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let pid = ParticipantId(participant_id.to_string());
         if !rs.meeting.participants.contains_key(&pid) {
-            return Err(anyhow::anyhow!("participant not joined"));
+            return Err(participant_not_joined());
         }
 
+        let track_count = track_ids.len() as u64;
         for raw_id in track_ids {
             let tid = crate::TrackId(raw_id);
             if let Some(publi) = rs.meeting.publications.get(&tid) {
                 if publi.publisher != pid {
-                    return Err(anyhow::anyhow!(
-                        "cannot unpublish track not owned by participant"
-                    ));
+                    return Err(cannot_unpublish_track_not_owned());
                 }
             }
             rs.meeting.publications.remove(&tid);
@@ -379,6 +408,7 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        self.metrics.add_meeting_unpublish_tracks(track_count);
         Ok(revision)
     }
 
@@ -389,15 +419,12 @@ impl RoomManager {
         track_ids: Vec<String>,
     ) -> Result<u64> {
         let mut g = self.inner.write();
-        let rs = g
-            .rooms
-            .get_mut(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let pid = ParticipantId(participant_id.to_string());
         if !rs.meeting.participants.contains_key(&pid) {
-            return Err(anyhow::anyhow!("participant not joined"));
+            return Err(participant_not_joined());
         }
 
         let wanted: Result<Vec<crate::TrackId>> = track_ids
@@ -405,7 +432,7 @@ impl RoomManager {
             .map(|id| {
                 let tid = crate::TrackId(id);
                 if !rs.meeting.publications.contains_key(&tid) {
-                    return Err(anyhow::anyhow!("unknown track requested"));
+                    return Err(unknown_track_requested());
                 }
                 Ok(tid)
             })
@@ -414,8 +441,10 @@ impl RoomManager {
         let wanted = wanted?;
         let mut new_video_publishers = HashSet::new();
         let subs = rs.meeting.subscription_requests.entry(pid).or_default();
+        let mut added_any_track = false;
         for tid in wanted {
             let is_new = subs.insert(tid.clone());
+            added_any_track |= is_new;
             if is_new
                 && let Some(publication) = rs.meeting.publications.get(&tid)
                 && matches!(publication.media_kind, crate::MediaKind::Video)
@@ -426,8 +455,14 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        if added_any_track && let Some(session) = rs.meeting_participants.get_mut(participant_id) {
+            let now = Instant::now();
+            session.subscribe_started_at = Some(now);
+            session.subscribe_keyframe_started_at = Some(now);
+        }
         drop(g);
 
+        self.metrics.inc_meeting_subscribe_requests();
         for publisher_id in new_video_publishers {
             self.schedule_meeting_keyframe_warmup(room.clone(), publisher_id);
         }
@@ -442,15 +477,12 @@ impl RoomManager {
         track_ids: Vec<String>,
     ) -> Result<u64> {
         let mut g = self.inner.write();
-        let rs = g
-            .rooms
-            .get_mut(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let pid = ParticipantId(participant_id.to_string());
         if !rs.meeting.participants.contains_key(&pid) {
-            return Err(anyhow::anyhow!("participant not joined"));
+            return Err(participant_not_joined());
         }
 
         let subs = rs.meeting.subscription_requests.entry(pid).or_default();
@@ -460,15 +492,13 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        self.metrics.inc_meeting_unsubscribe_requests();
         Ok(revision)
     }
 
     pub fn meeting_list_publications(&self, room: RoomId) -> Result<Vec<MeetingPublicationInfo>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         Ok(rs
@@ -486,10 +516,7 @@ impl RoomManager {
 
     pub fn meeting_list_participants(&self, room: RoomId) -> Result<Vec<MeetingParticipantInfo>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let mut out = rs
@@ -511,15 +538,12 @@ impl RoomManager {
         participant_id: &str,
     ) -> Result<Vec<String>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let pid = ParticipantId(participant_id.to_string());
         if !rs.meeting.participants.contains_key(&pid) {
-            return Err(anyhow::anyhow!("participant not joined"));
+            return Err(participant_not_joined());
         }
 
         let mut out = rs
@@ -538,15 +562,12 @@ impl RoomManager {
         participant_id: &str,
     ) -> Result<Vec<String>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let pid = ParticipantId(participant_id.to_string());
         if !rs.meeting.participants.contains_key(&pid) {
-            return Err(anyhow::anyhow!("participant not joined"));
+            return Err(participant_not_joined());
         }
 
         Ok(rs
@@ -559,10 +580,7 @@ impl RoomManager {
 
     pub fn meeting_list_streams(&self, room: RoomId) -> Result<Vec<MeetingStreamInfo>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
 
         let mut out = rs
@@ -581,10 +599,7 @@ impl RoomManager {
 
     pub fn broadcast_inspect(&self, room: RoomId) -> Result<BroadcastInspection> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_broadcast_mode(rs)?;
 
         let mut subscriber_ids = rs.subscribers.keys().cloned().collect::<Vec<_>>();
@@ -605,7 +620,11 @@ impl RoomManager {
             .values()
             .map(|plan| BroadcastSubscriberPlanInfo {
                 subscriber_id: plan.subscriber_id.0.clone(),
-                audio_track_ids: plan.audio.iter().map(|selection| selection.track_id.0.clone()).collect(),
+                audio_track_ids: plan
+                    .audio
+                    .iter()
+                    .map(|selection| selection.track_id.0.clone())
+                    .collect(),
                 video: plan
                     .video
                     .iter()
@@ -657,10 +676,7 @@ impl RoomManager {
     pub async fn meeting_leave(&self, room: RoomId, participant_id: &str) -> Result<()> {
         let participant = {
             let mut g = self.inner.write();
-            let rs = g
-                .rooms
-                .get_mut(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
 
             let pid = ParticipantId(participant_id.to_string());
@@ -689,12 +705,14 @@ impl RoomManager {
             }
             rs.meeting.next_revision();
             Self::recompute_meeting_plan(rs);
+            rs.meeting_joined_at.remove(participant_id);
             rs.meeting_participants.remove(participant_id)
         };
 
         if let Some(participant) = participant {
             participant.peer.stop().await?;
         }
+        self.metrics.inc_meeting_leaves();
         Ok(())
     }
 
@@ -705,133 +723,153 @@ impl RoomManager {
         revision: u64,
         offer_sdp: String,
     ) -> Result<MeetingSdpResponse> {
-        let need_create = {
-            let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
-            Self::require_meeting_mode(rs)?;
-            let pid = ParticipantId(participant_id.to_string());
-            if !rs.meeting.participants.contains_key(&pid) {
-                return Err(anyhow::anyhow!("participant not joined"));
-            }
-            if revision > rs.meeting.revision {
-                return Err(anyhow::anyhow!(
-                    "invalid future revision: got {revision}, current {}",
-                    rs.meeting.revision
-                ));
-            }
-            !rs.meeting_participants.contains_key(participant_id)
-        };
-
-        if need_create {
-            let peer = PeerSession::new(
-                self.gst.clone(),
-                participant_id.to_string(),
-                PeerRole::MeetingParticipant,
-                None,
-            )
-            .await?;
-            peer.start().await?;
-            let tap = peer.install_rtp_tap().await?;
-            let injector = peer.install_rtp_injector(Vec::new()).await?;
-
-            let ice = IceQueue::new();
-            start_ice_collector(peer.ice_subscribe(), ice.clone());
-
-            let rooms = self.clone();
-            let room_for_tap = room.clone();
-            let participant_for_tap = participant_id.to_string();
-            tokio::spawn(async move {
-                let mut rx = tap.rx;
-                while let Some(pkt) = rx.recv().await {
-                    rooms.forward_meeting_rtp(&room_for_tap, &participant_for_tap, pkt);
+        self.metrics.inc_meeting_sdp_offers();
+        let result: Result<MeetingSdpResponse> = async {
+            let need_create = {
+                let g = self.inner.read();
+                let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+                Self::require_meeting_mode(rs)?;
+                let pid = ParticipantId(participant_id.to_string());
+                if !rs.meeting.participants.contains_key(&pid) {
+                    return Err(participant_not_joined());
                 }
-            });
+                if revision > rs.meeting.revision {
+                    return Err(invalid_future_revision(revision, rs.meeting.revision));
+                }
+                !rs.meeting_participants.contains_key(participant_id)
+            };
 
-            let mut g = self.inner.write();
-            let rs = g
-                .rooms
-                .get_mut(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
-            Self::require_meeting_mode(rs)?;
-            rs.meeting_participants
-                .entry(participant_id.to_string())
-                .or_insert(MeetingParticipantSession {
-                    id: participant_id.to_string(),
-                    peer,
-                    ice,
-                    injector_tx: injector.tx.clone(),
-                    ssrc_to_mid: HashMap::new(),
-                    mid_routing: HashMap::new(),
+            if need_create {
+                let peer = PeerSession::new(
+                    self.gst.clone(),
+                    participant_id.to_string(),
+                    PeerRole::MeetingParticipant,
+                    Some(Arc::new(RoomPeerEvents {
+                        rooms: self.clone(),
+                        room: room.clone(),
+                        tokio_handle: Handle::current(),
+                        metrics: self.metrics.clone(),
+                        role: PeerRole::MeetingParticipant,
+                    })),
+                )
+                .await?;
+                peer.start().await?;
+                let tap = peer.install_rtp_tap().await?;
+                let injector = peer.install_rtp_injector(Vec::new()).await?;
+
+                let ice = IceQueue::new();
+                start_ice_collector(peer.ice_subscribe(), ice.clone());
+
+                let rooms = self.clone();
+                let room_for_tap = room.clone();
+                let participant_for_tap = participant_id.to_string();
+                tokio::spawn(async move {
+                    let mut rx = tap.rx;
+                    while let Some(pkt) = rx.recv().await {
+                        rooms.forward_meeting_rtp(&room_for_tap, &participant_for_tap, pkt);
+                    }
                 });
-        }
 
-        let offer_ssrc_to_mid = parse_offer_ssrc_to_mid(&offer_sdp);
-        let offer_media_mids = parse_offer_media_mids(&offer_sdp);
-        let offer_mid_routing = parse_offer_mid_routing(&offer_sdp);
-
-        {
-            let mut g = self.inner.write();
-            let rs = g
-                .rooms
-                .get_mut(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
-            Self::require_meeting_mode(rs)?;
-
-            if let Some(session) = rs.meeting_participants.get_mut(participant_id) {
-                session.ssrc_to_mid = offer_ssrc_to_mid;
-                session.mid_routing = offer_mid_routing;
+                let mut g = self.inner.write();
+                let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
+                Self::require_meeting_mode(rs)?;
+                let joined_at = rs
+                    .meeting_joined_at
+                    .get(participant_id)
+                    .copied()
+                    .unwrap_or_else(Instant::now);
+                rs.meeting_participants
+                    .entry(participant_id.to_string())
+                    .or_insert(MeetingParticipantSession {
+                        id: participant_id.to_string(),
+                        peer,
+                        ice,
+                        injector_tx: injector.tx.clone(),
+                        ssrc_to_mid: HashMap::new(),
+                        mid_routing: HashMap::new(),
+                        joined_at,
+                        first_join_rtp_forwarded: false,
+                        first_join_video_keyframe_forwarded: false,
+                        subscribe_started_at: None,
+                        subscribe_keyframe_started_at: None,
+                    });
             }
 
-            for (media_kind, mid) in offer_media_mids {
-                let mut matching_tracks = rs
-                    .meeting
-                    .publications
-                    .values_mut()
-                    .filter(|publication| {
-                        publication.publisher.0 == participant_id
-                            && publication.media_kind == media_kind
-                            && publication.mid.is_none()
-                    })
-                    .collect::<Vec<_>>();
-                if matching_tracks.len() == 1 {
-                    matching_tracks[0].mid = Some(mid);
+            let offer_ssrc_to_mid = parse_offer_ssrc_to_mid(&offer_sdp);
+            let offer_media_mids = parse_offer_media_mids(&offer_sdp);
+            let offer_mid_routing = parse_offer_mid_routing(&offer_sdp);
+
+            {
+                let mut g = self.inner.write();
+                let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
+                Self::require_meeting_mode(rs)?;
+
+                if let Some(session) = rs.meeting_participants.get_mut(participant_id) {
+                    session.ssrc_to_mid = offer_ssrc_to_mid;
+                    session.mid_routing = offer_mid_routing;
                 }
+
+                for (media_kind, mid) in offer_media_mids {
+                    let mut matching_tracks = rs
+                        .meeting
+                        .publications
+                        .values_mut()
+                        .filter(|publication| {
+                            publication.publisher.0 == participant_id
+                                && publication.media_kind == media_kind
+                                && publication.mid.is_none()
+                        })
+                        .collect::<Vec<_>>();
+                    if matching_tracks.len() == 1 {
+                        matching_tracks[0].mid = Some(mid);
+                    }
+                }
+
+                Self::recompute_meeting_plan(rs);
             }
 
-            Self::recompute_meeting_plan(rs);
-        }
+            let peer = {
+                let g = self.inner.read();
+                let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+                Self::require_meeting_mode(rs)?;
+                rs.meeting_participants
+                    .get(participant_id)
+                    .ok_or_else(meeting_participant_session_not_found)?
+                    .peer
+                    .clone()
+            };
 
-        let peer = {
+            let answer_sdp = peer.negotiate_as_answerer(offer_sdp).await?;
+            peer.play().await?;
+
             let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
-            rs.meeting_participants
-                .get(participant_id)
-                .ok_or_else(|| anyhow::anyhow!("meeting participant session not found"))?
-                .peer
-                .clone()
-        };
 
-        let answer_sdp = peer.negotiate_as_answerer(offer_sdp).await?;
-        peer.play().await?;
+            Ok(MeetingSdpResponse {
+                answer_sdp,
+                revision: rs.meeting.revision,
+            })
+        }
+        .await;
 
-        let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
-        Self::require_meeting_mode(rs)?;
-
-        Ok(MeetingSdpResponse {
-            answer_sdp,
-            revision: rs.meeting.revision,
-        })
+        self.metrics.observe_negotiation(
+            "meeting_sdp_offer",
+            result.is_ok(),
+            result
+                .as_ref()
+                .map(|_| "none")
+                .unwrap_or_else(|err| classify_negotiation_error(err)),
+        );
+        if let Err(err) = &result {
+            tracing::warn!(
+                room = %room.0,
+                participant_id = %participant_id,
+                cause = classify_negotiation_error(err),
+                "meeting SDP negotiation failed: {err:#}"
+            );
+        }
+        result
     }
 
     pub async fn meeting_trickle(
@@ -841,16 +879,14 @@ impl RoomManager {
         mline: u32,
         cand: String,
     ) -> Result<()> {
+        self.metrics.inc_meeting_trickle_ice();
         let peer = {
             let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
             rs.meeting_participants
                 .get(participant_id)
-                .ok_or_else(|| anyhow::anyhow!("meeting participant session not found"))?
+                .ok_or_else(meeting_participant_session_not_found)?
                 .peer
                 .clone()
         };
@@ -864,15 +900,12 @@ impl RoomManager {
         max: usize,
     ) -> Result<Vec<media::IceCandidate>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
         let participant = rs
             .meeting_participants
             .get(participant_id)
-            .ok_or_else(|| anyhow::anyhow!("meeting participant session not found"))?;
+            .ok_or_else(meeting_participant_session_not_found)?;
         Ok(participant.ice.drain(max))
     }
 
@@ -881,6 +914,8 @@ impl RoomManager {
             Some(v) => v,
             None => return,
         };
+        let is_video_keyframe =
+            matches!(kind, crate::MediaKind::Video) && is_probable_video_keyframe(&pkt);
 
         let (track_id, targets) = {
             let mut g = self.inner.write();
@@ -918,14 +953,12 @@ impl RoomManager {
                 return;
             };
 
-            let rid = mapped_mid
-                .as_ref()
-                .and_then(|mid| {
-                    rs.meeting_participants
-                        .get(publisher_id)
-                        .and_then(|session| session.mid_routing.get(mid))
-                        .and_then(|routing| parse_rtp_rid(&pkt.data, routing.rid_ext_id?))
-                });
+            let rid = mapped_mid.as_ref().and_then(|mid| {
+                rs.meeting_participants
+                    .get(publisher_id)
+                    .and_then(|session| session.mid_routing.get(mid))
+                    .and_then(|routing| parse_rtp_rid(&pkt.data, routing.rid_ext_id?))
+            });
             let packet_encoding_id = rid
                 .clone()
                 .or_else(|| pkt.meta.ssrc.map(|ssrc| format!("ssrc:{ssrc}")));
@@ -949,9 +982,7 @@ impl RoomManager {
                 });
                 let entry = rs.meeting_streams.entry(track_id.clone()).or_default();
                 entry.entry(ssrc).or_insert_with(|| {
-                    let encoding_id = rid
-                        .clone()
-                        .unwrap_or_else(|| format!("ssrc:{ssrc}"));
+                    let encoding_id = rid.clone().unwrap_or_else(|| format!("ssrc:{ssrc}"));
                     tracing::info!(
                         publisher_id = %publisher_id,
                         track_id = %track_id_for_log,
@@ -996,9 +1027,36 @@ impl RoomManager {
                     if !allowed {
                         return None;
                     }
-                    rs.meeting_participants
-                        .get(&forwarding.subscriber_id.0)
-                        .map(|sess| (forwarding.subscriber_id.0.clone(), sess.injector_tx.clone()))
+                    let session = rs
+                        .meeting_participants
+                        .get_mut(&forwarding.subscriber_id.0)?;
+                    if !session.first_join_rtp_forwarded {
+                        self.metrics
+                            .observe_meeting_join_to_first_rtp(session.joined_at.elapsed());
+                        session.first_join_rtp_forwarded = true;
+                    }
+                    if let Some(started_at) = session.subscribe_started_at.take() {
+                        self.metrics
+                            .observe_meeting_subscribe_to_first_rtp(started_at.elapsed());
+                    }
+                    if is_video_keyframe && !session.first_join_video_keyframe_forwarded {
+                        self.metrics.observe_meeting_join_to_first_video_keyframe(
+                            session.joined_at.elapsed(),
+                        );
+                        session.first_join_video_keyframe_forwarded = true;
+                    }
+                    if is_video_keyframe
+                        && let Some(started_at) = session.subscribe_keyframe_started_at.take()
+                    {
+                        self.metrics
+                            .observe_meeting_subscribe_to_first_video_keyframe(
+                                started_at.elapsed(),
+                            );
+                    }
+                    Some((
+                        forwarding.subscriber_id.0.clone(),
+                        session.injector_tx.clone(),
+                    ))
                 })
                 .collect::<Vec<_>>();
 
@@ -1037,6 +1095,7 @@ impl RoomManager {
             match tx.try_send(pkt.clone()) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
+                    self.metrics.inc_meeting_rtp_dropped("queue_full");
                     tracing::warn!(
                         publisher_id = %publisher_id,
                         subscriber_id = %participant_id,
@@ -1045,6 +1104,7 @@ impl RoomManager {
                     );
                 }
                 Err(TrySendError::Closed(_)) => {
+                    self.metrics.inc_meeting_rtp_dropped("channel_closed");
                     tracing::debug!(
                         publisher_id = %publisher_id,
                         subscriber_id = %participant_id,
@@ -1065,7 +1125,9 @@ impl RoomManager {
                     .await
                 {
                     tracing::warn!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
+                        cause = classify_negotiation_error(&err),
                         attempt,
                         "meeting keyframe warmup request failed: {err:#}"
                     );
@@ -1085,6 +1147,8 @@ impl RoomManager {
         let Some(kind) = media_kind_from_packet(&pkt) else {
             return;
         };
+        let is_video_keyframe =
+            matches!(kind, crate::MediaKind::Video) && is_probable_video_keyframe(&pkt);
 
         let (targets, stream_key) = {
             let mut g = self.inner.write();
@@ -1103,14 +1167,24 @@ impl RoomManager {
                 .for_track(&track_id)
                 .iter()
                 .filter_map(|forwarding| match (&forwarding.kind, kind) {
-                    (ForwardingKind::Audio, crate::MediaKind::Audio) => rs
-                        .subscribers
-                        .get(&forwarding.subscriber_id.0)
-                        .map(|sess| sess.injector_tx.clone()),
-                    (ForwardingKind::Video(_), crate::MediaKind::Video) => rs
-                        .subscribers
-                        .get(&forwarding.subscriber_id.0)
-                        .map(|sess| sess.injector_tx.clone()),
+                    (ForwardingKind::Audio, crate::MediaKind::Audio)
+                    | (ForwardingKind::Video(_), crate::MediaKind::Video) => {
+                        let sess = rs.subscribers.get_mut(&forwarding.subscriber_id.0)?;
+                        if !sess.first_rtp_forwarded {
+                            self.metrics.observe_broadcast_subscribe_to_first_rtp(
+                                sess.subscribed_at.elapsed(),
+                            );
+                            sess.first_rtp_forwarded = true;
+                        }
+                        if is_video_keyframe && !sess.first_video_keyframe_forwarded {
+                            self.metrics
+                                .observe_broadcast_subscribe_to_first_video_keyframe(
+                                    sess.subscribed_at.elapsed(),
+                                );
+                            sess.first_video_keyframe_forwarded = true;
+                        }
+                        Some(sess.injector_tx.clone())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1121,13 +1195,16 @@ impl RoomManager {
             if let Err(err) = target.try_send(pkt.clone()) {
                 match err {
                     TrySendError::Full(_) => {
+                        self.metrics.inc_broadcast_rtp_dropped("queue_full");
                         tracing::warn!(
                             room = %room.0,
                             stream = %stream_key,
                             "dropping broadcast RTP packet because subscriber injector queue is full"
                         );
                     }
-                    TrySendError::Closed(_) => {}
+                    TrySendError::Closed(_) => {
+                        self.metrics.inc_broadcast_rtp_dropped("channel_closed");
+                    }
                 }
             }
         }
@@ -1140,14 +1217,11 @@ impl RoomManager {
     ) -> Result<()> {
         let peer = {
             let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
             rs.meeting_participants
                 .get(participant_id)
-                .ok_or_else(|| anyhow::anyhow!("meeting publisher session not found"))?
+                .ok_or_else(meeting_publisher_session_not_found)?
                 .peer
                 .clone()
         };
@@ -1158,16 +1232,9 @@ impl RoomManager {
     async fn request_publisher_keyframe(&self, room: RoomId) -> Result<()> {
         let publisher = {
             let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
-            rs.publisher
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no publisher"))?
-                .peer
-                .clone()
+            rs.publisher.as_ref().ok_or_else(no_publisher)?.peer.clone()
         };
 
         publisher.request_keyframe().await
@@ -1175,59 +1242,84 @@ impl RoomManager {
 
     /// POST /whip/:room  (offer SDP -> answer SDP)
     pub async fn whip_publish(&self, room: RoomId, offer_sdp: String) -> Result<SdpResponse> {
-        let pub_id = Uuid::new_v4().to_string();
+        let result: Result<SdpResponse> = async {
+            let pub_id = Uuid::new_v4().to_string();
 
-        let peer = PeerSession::new(
-            self.gst.clone(),
-            pub_id.clone(),
-            PeerRole::WhipPublisher,
-            None,
-        )
-        .await?;
+            let peer = PeerSession::new(
+                self.gst.clone(),
+                pub_id.clone(),
+                PeerRole::WhipPublisher,
+                Some(Arc::new(RoomPeerEvents {
+                    rooms: self.clone(),
+                    room: room.clone(),
+                    tokio_handle: Handle::current(),
+                    metrics: self.metrics.clone(),
+                    role: PeerRole::WhipPublisher,
+                })),
+            )
+            .await?;
 
-        peer.start().await?;
-        let answer = peer.negotiate_as_answerer(offer_sdp).await?;
+            peer.start().await?;
+            let answer = peer.negotiate_as_answerer(offer_sdp).await?;
 
-        // Install RTP tap (audio + video will appear as src_%u pads)
-        let tap = peer.install_rtp_tap().await?;
-        peer.play().await?;
-        let ice = IceQueue::new();
-        start_ice_collector(peer.ice_subscribe(), ice.clone());
+            let tap = peer.install_rtp_tap().await?;
+            peer.play().await?;
+            let ice = IceQueue::new();
+            start_ice_collector(peer.ice_subscribe(), ice.clone());
 
-        let old_publisher = {
-            let mut g = self.inner.write();
-            let rs = Self::room_mut(&mut g, &room);
-            Self::require_broadcast_mode(rs)?;
+            let old_publisher = {
+                let mut g = self.inner.write();
+                let rs = Self::room_mut(&mut g, &room);
+                Self::require_broadcast_mode(rs)?;
 
-            let old_publisher = rs.publisher.take();
-            rs.broadcast_streams.clear();
-            // v1 policy: replace existing publisher
-            rs.publisher = Some(PublisherSession {
-                id: pub_id.clone(),
-                peer,
-                ice,
-            });
-            Self::recompute_broadcast_graph(rs);
-            old_publisher
-        };
+                let old_publisher = rs.publisher.take();
+                rs.broadcast_streams.clear();
+                rs.publisher = Some(PublisherSession {
+                    id: pub_id.clone(),
+                    peer,
+                    ice,
+                });
+                Self::recompute_broadcast_graph(rs);
+                old_publisher
+            };
 
-        if let Some(old_publisher) = old_publisher {
-            old_publisher.peer.stop().await?;
-        }
-
-        let rooms = self.clone();
-        let room_for_forward = room.clone();
-        tokio::spawn(async move {
-            let mut rx = tap.rx;
-            while let Some(pkt) = rx.recv().await {
-                rooms.forward_broadcast_rtp(&room_for_forward, pkt);
+            if let Some(old_publisher) = old_publisher {
+                old_publisher.peer.stop().await?;
             }
-        });
 
-        Ok(SdpResponse {
-            answer_sdp: answer,
-            location: format!("/whip/{}/{}", room.0, pub_id),
-        })
+            let rooms = self.clone();
+            let room_for_forward = room.clone();
+            tokio::spawn(async move {
+                let mut rx = tap.rx;
+                while let Some(pkt) = rx.recv().await {
+                    rooms.forward_broadcast_rtp(&room_for_forward, pkt);
+                }
+            });
+
+            self.metrics.inc_broadcast_publishers_started();
+            Ok(SdpResponse {
+                answer_sdp: answer,
+                location: format!("/whip/{}/{}", room.0, pub_id),
+            })
+        }
+        .await;
+
+        self.metrics.observe_negotiation(
+            "broadcast_whip_publish",
+            result.is_ok(),
+            result
+                .as_ref()
+                .map(|_| "none")
+                .unwrap_or_else(|err| classify_negotiation_error(err)),
+        );
+        if let Err(err) = &result {
+            tracing::warn!(
+                room = %room.0,
+                cause = classify_negotiation_error(err),
+                "broadcast WHIP negotiation failed: {err:#}"
+            );
+        }
+        result
     }
 
     /// PATCH /whip/:room/:pub  (client trickle ICE -> server)
@@ -1238,19 +1330,14 @@ impl RoomManager {
         mline: u32,
         cand: String,
     ) -> Result<()> {
+        self.metrics.inc_broadcast_whip_trickle_ice();
         let pub_peer = {
             let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
-            let pub_sess = rs
-                .publisher
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no publisher"))?;
+            let pub_sess = rs.publisher.as_ref().ok_or_else(no_publisher)?;
             if pub_sess.id != pub_id {
-                return Err(anyhow::anyhow!("publisher id mismatch"));
+                return Err(publisher_id_mismatch());
             }
             pub_sess.peer.clone()
         };
@@ -1265,17 +1352,11 @@ impl RoomManager {
         max: usize,
     ) -> Result<Vec<media::IceCandidate>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_broadcast_mode(rs)?;
-        let pub_sess = rs
-            .publisher
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no publisher"))?;
+        let pub_sess = rs.publisher.as_ref().ok_or_else(no_publisher)?;
         if pub_sess.id != pub_id {
-            return Err(anyhow::anyhow!("publisher id mismatch"));
+            return Err(publisher_id_mismatch());
         }
         Ok(pub_sess.ice.drain(max))
     }
@@ -1283,18 +1364,12 @@ impl RoomManager {
     pub async fn whip_stop(&self, room: RoomId, pub_id: &str) -> Result<()> {
         let pub_sess = {
             let mut g = self.inner.write();
-            let rs = g
-                .rooms
-                .get_mut(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
 
-            let cur = rs
-                .publisher
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no publisher"))?;
+            let cur = rs.publisher.as_ref().ok_or_else(no_publisher)?;
             if cur.id != pub_id {
-                return Err(anyhow::anyhow!("publisher id mismatch"));
+                return Err(publisher_id_mismatch());
             }
 
             rs.broadcast_streams.clear();
@@ -1303,95 +1378,111 @@ impl RoomManager {
         };
 
         pub_sess.peer.stop().await?;
+        self.metrics.inc_broadcast_publishers_stopped();
         Ok(())
     }
 
     /// POST /whep/:room  (offer SDP -> answer SDP)
     pub async fn whep_subscribe(&self, room: RoomId, offer_sdp: String) -> Result<SdpResponse> {
-        let sub_id = Uuid::new_v4().to_string();
+        let result: Result<SdpResponse> = async {
+            let sub_id = Uuid::new_v4().to_string();
 
-        // v1 policy: require publisher exists
-        let stream_infos = {
-            let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
-            Self::require_broadcast_mode(rs)?;
-            rs.publisher
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no publisher"))?;
-            rs.broadcast_streams.values().cloned().collect::<Vec<_>>()
-        };
+            let stream_infos = {
+                let g = self.inner.read();
+                let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+                Self::require_broadcast_mode(rs)?;
+                rs.publisher.as_ref().ok_or_else(no_publisher)?;
+                rs.broadcast_streams.values().cloned().collect::<Vec<_>>()
+            };
 
-        if stream_infos.is_empty() {
-            return Err(anyhow::anyhow!(
-                "publisher has not produced RTP yet; try subscribing after media is flowing"
-            ));
-        }
+            if stream_infos.is_empty() {
+                return Err(publisher_not_flowing());
+            }
 
-        // v1 policy: require publisher exists
-        {
-            let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
-            Self::require_broadcast_mode(rs)?;
-            rs.publisher
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no publisher"))?;
-        }
+            {
+                let g = self.inner.read();
+                let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+                Self::require_broadcast_mode(rs)?;
+                rs.publisher.as_ref().ok_or_else(no_publisher)?;
+            }
 
-        let peer = PeerSession::new(
-            self.gst.clone(),
-            sub_id.clone(),
-            PeerRole::WhepSubscriber,
-            Some(Arc::new(RoomPeerEvents {
-                rooms: self.clone(),
-                room: room.clone(),
-                tokio_handle: Handle::current(),
-            })),
-        )
-        .await?;
-
-        peer.set_whep_streams(stream_infos);
-        peer.start().await?;
-        let answer = peer.negotiate_as_answerer(offer_sdp).await?;
-        let injector = peer
-            .take_whep_injector()
-            .ok_or_else(|| anyhow::anyhow!("whep injector was not created during negotiation"))?;
-        peer.play().await?;
-
-        // Prompt a fresh keyframe as soon as a subscriber joins so startup
-        // doesn't depend on the publisher's natural GOP interval.
-        if let Err(err) = self.request_publisher_keyframe(room.clone()).await {
-            tracing::warn!("failed to request keyframe for new subscriber: {err:#}");
-        }
-
-        let ice = IceQueue::new();
-        start_ice_collector(peer.ice_subscribe(), ice.clone());
-
-        {
-            let mut g = self.inner.write();
-            let rs = Self::room_mut(&mut g, &room);
-            Self::require_broadcast_mode(rs)?;
-            rs.subscribers.insert(
+            let peer = PeerSession::new(
+                self.gst.clone(),
                 sub_id.clone(),
-                SubscriberSession {
-                    id: sub_id.clone(),
-                    peer,
-                    ice,
-                    injector_tx: injector.tx.clone(),
-                },
-            );
-            Self::recompute_broadcast_graph(rs);
-        }
+                PeerRole::WhepSubscriber,
+                Some(Arc::new(RoomPeerEvents {
+                    rooms: self.clone(),
+                    room: room.clone(),
+                    tokio_handle: Handle::current(),
+                    metrics: self.metrics.clone(),
+                    role: PeerRole::WhepSubscriber,
+                })),
+            )
+            .await?;
 
-        Ok(SdpResponse {
-            answer_sdp: answer,
-            location: format!("/whep/{}/{}", room.0, sub_id),
-        })
+            peer.set_whep_streams(stream_infos);
+            peer.start().await?;
+            let answer = peer.negotiate_as_answerer(offer_sdp).await?;
+            let injector = peer
+                .take_whep_injector()
+                .ok_or_else(|| whep_injector_not_created())?;
+            peer.play().await?;
+
+            if let Err(err) = self.request_publisher_keyframe(room.clone()).await {
+                tracing::warn!(
+                    room = %room.0,
+                    subscriber_id = %sub_id,
+                    cause = classify_negotiation_error(&err),
+                    "failed to request keyframe for new subscriber: {err:#}"
+                );
+            }
+
+            let ice = IceQueue::new();
+            start_ice_collector(peer.ice_subscribe(), ice.clone());
+
+            {
+                let mut g = self.inner.write();
+                let rs = Self::room_mut(&mut g, &room);
+                Self::require_broadcast_mode(rs)?;
+                rs.subscribers.insert(
+                    sub_id.clone(),
+                    SubscriberSession {
+                        id: sub_id.clone(),
+                        peer,
+                        ice,
+                        injector_tx: injector.tx.clone(),
+                        subscribed_at: Instant::now(),
+                        first_rtp_forwarded: false,
+                        first_video_keyframe_forwarded: false,
+                    },
+                );
+                Self::recompute_broadcast_graph(rs);
+            }
+
+            self.metrics.inc_broadcast_subscribers_started();
+            Ok(SdpResponse {
+                answer_sdp: answer,
+                location: format!("/whep/{}/{}", room.0, sub_id),
+            })
+        }
+        .await;
+
+        self.metrics.observe_negotiation(
+            "broadcast_whep_subscribe",
+            result.is_ok(),
+            result
+                .as_ref()
+                .map(|_| "none")
+                .unwrap_or_else(|err| classify_negotiation_error(err)),
+        );
+        if let Err(err) = &result {
+            tracing::warn!(
+                room = %room.0,
+                cause = classify_negotiation_error(err),
+                "broadcast WHEP negotiation failed: {err:#}"
+            );
+        }
+        result
     }
 
     /// PATCH /whep/:room/:sub  (client trickle ICE -> server)
@@ -1402,17 +1493,15 @@ impl RoomManager {
         mline: u32,
         cand: String,
     ) -> Result<()> {
+        self.metrics.inc_broadcast_whep_trickle_ice();
         let sub_peer = {
             let g = self.inner.read();
-            let rs = g
-                .rooms
-                .get(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
             let sub = rs
                 .subscribers
                 .get(sub_id)
-                .ok_or_else(|| anyhow::anyhow!("subscriber not found"))?;
+                .ok_or_else(subscriber_not_found)?;
             sub.peer.clone()
         };
 
@@ -1427,15 +1516,12 @@ impl RoomManager {
         max: usize,
     ) -> Result<Vec<media::IceCandidate>> {
         let g = self.inner.read();
-        let rs = g
-            .rooms
-            .get(&room)
-            .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
         Self::require_broadcast_mode(rs)?;
         let sub = rs
             .subscribers
             .get(sub_id)
-            .ok_or_else(|| anyhow::anyhow!("subscriber not found"))?;
+            .ok_or_else(subscriber_not_found)?;
         Ok(sub.ice.drain(max))
     }
 
@@ -1443,22 +1529,20 @@ impl RoomManager {
         // take subscriber out of state first (short lock)
         let sub = {
             let mut g = self.inner.write();
-            let rs = g
-                .rooms
-                .get_mut(&room)
-                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
 
             let sub = rs
                 .subscribers
                 .remove(sub_id)
-                .ok_or_else(|| anyhow::anyhow!("subscriber not found"))?;
+                .ok_or_else(subscriber_not_found)?;
             Self::recompute_broadcast_graph(rs);
             sub
         };
 
         // stop media outside lock
         sub.peer.stop().await?;
+        self.metrics.inc_broadcast_subscribers_stopped();
         Ok(())
     }
 }
@@ -1479,6 +1563,90 @@ fn broadcast_track_id(kind: crate::MediaKind) -> crate::TrackId {
         crate::MediaKind::Audio => crate::TrackId("__broadcast_audio".to_string()),
         crate::MediaKind::Video => crate::TrackId("__broadcast_video".to_string()),
     }
+}
+
+fn peer_role_label(role: PeerRole) -> &'static str {
+    match role {
+        PeerRole::WhipPublisher => "broadcast_publisher",
+        PeerRole::WhepSubscriber => "broadcast_subscriber",
+        PeerRole::MeetingParticipant => "meeting_participant",
+    }
+}
+
+fn peer_state_label(state: PeerState) -> &'static str {
+    match state {
+        PeerState::New => "new",
+        PeerState::Negotiating => "negotiating",
+        PeerState::Connected => "connected",
+        PeerState::Failed => "failed",
+        PeerState::Closed => "closed",
+    }
+}
+
+fn classify_negotiation_error(err: &anyhow::Error) -> &'static str {
+    err.downcast_ref::<Error>()
+        .map(Error::cause_label)
+        .unwrap_or("internal")
+}
+
+fn room_not_found() -> anyhow::Error {
+    Error::RoomNotFound.into()
+}
+
+fn participant_not_joined() -> anyhow::Error {
+    Error::ParticipantNotJoined.into()
+}
+
+fn meeting_participant_session_not_found() -> anyhow::Error {
+    Error::MeetingParticipantSessionNotFound.into()
+}
+
+fn meeting_publisher_session_not_found() -> anyhow::Error {
+    Error::MeetingPublisherSessionNotFound.into()
+}
+
+fn subscriber_not_found() -> anyhow::Error {
+    Error::SubscriberNotFound.into()
+}
+
+fn no_publisher() -> anyhow::Error {
+    Error::NoPublisher.into()
+}
+
+fn publisher_id_mismatch() -> anyhow::Error {
+    Error::PublisherIdMismatch.into()
+}
+
+fn unknown_track_requested() -> anyhow::Error {
+    Error::UnknownTrackRequested.into()
+}
+
+fn cannot_unpublish_track_not_owned() -> anyhow::Error {
+    Error::CannotUnpublishTrackNotOwned.into()
+}
+
+fn room_already_active_in_broadcast_mode() -> anyhow::Error {
+    Error::RoomAlreadyActiveInBroadcastMode.into()
+}
+
+fn broadcast_endpoints_unavailable_in_meeting_mode() -> anyhow::Error {
+    Error::BroadcastEndpointsUnavailableInMeetingMode.into()
+}
+
+fn meeting_signaling_unavailable_in_broadcast_mode() -> anyhow::Error {
+    Error::MeetingSignalingUnavailableInBroadcastMode.into()
+}
+
+fn invalid_future_revision(got: u64, current: u64) -> anyhow::Error {
+    Error::InvalidFutureRevision { got, current }.into()
+}
+
+fn publisher_not_flowing() -> anyhow::Error {
+    Error::PublisherNotFlowing.into()
+}
+
+fn whep_injector_not_created() -> anyhow::Error {
+    Error::WhepInjectorNotCreated.into()
 }
 
 fn video_forwarding_allows_packet(
@@ -1541,7 +1709,11 @@ fn select_preferred_encoding_id(
             (Some(_), None) => true,
             (None, _) => false,
         })
-        .or_else(|| candidates.iter().find(|stream| stream.spatial_layer.is_none()))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|stream| stream.spatial_layer.is_none())
+        })
         .map(|stream| stream.encoding_id.clone())
 }
 
