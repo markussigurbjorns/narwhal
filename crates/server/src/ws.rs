@@ -55,7 +55,7 @@ struct RpcResponse {
     error: Option<RpcError>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RpcError {
     code: i32,
     message: String,
@@ -679,7 +679,10 @@ fn rpc_core_error(err: CoreError) -> RpcError {
 
 #[cfg(test)]
 mod tests {
-    use super::{JoinedParticipant, SessionState, handle_text, join, leave};
+    use super::{
+        JoinedParticipant, SessionState, handle_text, join, leave, publish_tracks, sdp_offer,
+        subscribe,
+    };
     use media::GstRuntime;
     use narwhal_core::{RoomId, RoomManager};
     use serde_json::json;
@@ -749,5 +752,105 @@ mod tests {
         let error = response.error.expect("rpc error expected");
         assert_eq!(error.code, 4220);
         assert_eq!(error.message, "not joined");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_mutations_increment_revision() {
+        let rooms = manager();
+        let room = RoomId("meeting-revision".to_string());
+        let alice_revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "alice".to_string(),
+                revision: alice_revision,
+            }),
+        };
+
+        let publish_result = publish_tracks(
+            &mut state,
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-audio",
+                        "media_kind": "audio",
+                        "mid": "0"
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "publish should succeed: code={} message={}",
+                err.code, err.message
+            )
+        });
+        let publish_revision = publish_result["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert!(publish_revision > bob_revision);
+
+        state.joined = Some(JoinedParticipant {
+            room,
+            participant_id: "bob".to_string(),
+            revision: bob_revision,
+        });
+
+        let subscribe_result = subscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-audio"]
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "subscribe should succeed: code={} message={}",
+                err.code, err.message
+            )
+        });
+        let subscribe_revision = subscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert!(subscribe_revision > publish_revision);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdp_offer_rejects_future_revision_before_negotiation() {
+        let rooms = manager();
+        let room = RoomId("meeting-future-revision".to_string());
+        let revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(JoinedParticipant {
+                room,
+                participant_id: "alice".to_string(),
+                revision,
+            }),
+        };
+
+        let err = sdp_offer(
+            &mut state,
+            json!({
+                "revision": revision + 100,
+                "offer_sdp": "v=0\r\n"
+            }),
+        )
+        .await
+        .expect_err("future revision should fail");
+
+        assert_eq!(err.code, 4220);
+        assert_eq!(err.message, "invalid future revision: got 101, current 1");
     }
 }

@@ -56,6 +56,10 @@ Observability contract:
 
 - [docs/observability.md](/home/maggi/Documents/workspace/narwhal/docs/observability.md)
 
+Runtime configuration:
+
+- [docs/config.md](/home/maggi/Documents/workspace/narwhal/docs/config.md)
+
 Signaling contract:
 
 - [docs/signaling.md](/home/maggi/Documents/workspace/narwhal/docs/signaling.md)
@@ -73,6 +77,7 @@ Implemented areas include:
 - broadcast and meeting room modes
 - shared error taxonomy across core, transport, metrics, and logs
 - Prometheus metrics and first-media timing histograms
+- bounded-queue overload handling with slow-subscriber eviction
 - browser demo clients
 - unit and route-level tests for the current signaling and observability layers
 

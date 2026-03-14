@@ -21,6 +21,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+const DEFAULT_SLOW_SUBSCRIBER_DROP_STREAK_LIMIT: u32 = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RoomId(pub String);
 
@@ -100,7 +102,21 @@ pub struct MeetingStreamInfo {
 pub struct RoomManager {
     gst: GstRuntime,
     metrics: AppMetrics,
+    config: RoomManagerConfig,
     inner: Arc<RwLock<Rooms>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoomManagerConfig {
+    pub slow_subscriber_drop_streak_limit: u32,
+}
+
+impl Default for RoomManagerConfig {
+    fn default() -> Self {
+        Self {
+            slow_subscriber_drop_streak_limit: DEFAULT_SLOW_SUBSCRIBER_DROP_STREAK_LIMIT,
+        }
+    }
 }
 
 struct Rooms {
@@ -132,6 +148,21 @@ struct RoomPeerEvents {
     role: PeerRole,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum EvictionReason {
+    SlowConsumer,
+    ChannelClosed,
+}
+
+impl EvictionReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            EvictionReason::SlowConsumer => "slow_consumer",
+            EvictionReason::ChannelClosed => "channel_closed",
+        }
+    }
+}
+
 impl PeerEvents for RoomPeerEvents {
     fn on_state(&self, _peer_id: &String, state: PeerState) {
         self.metrics
@@ -154,9 +185,14 @@ impl PeerEvents for RoomPeerEvents {
 
 impl RoomManager {
     pub fn new(gst: GstRuntime) -> Self {
+        Self::with_config(gst, RoomManagerConfig::default())
+    }
+
+    pub fn with_config(gst: GstRuntime, config: RoomManagerConfig) -> Self {
         Self {
             gst,
             metrics: AppMetrics::default(),
+            config,
             inner: Arc::new(RwLock::new(Rooms {
                 rooms: HashMap::new(),
             })),
@@ -247,6 +283,45 @@ impl RoomManager {
         };
         rs.broadcast_plan = crate::build_broadcast_plan_from_facts(&facts);
         rs.broadcast_graph = compile_forwarding_graph(&rs.broadcast_plan);
+    }
+
+    fn remove_meeting_participant_state(
+        rs: &mut RoomState,
+        participant_id: &str,
+    ) -> Result<Option<MeetingParticipantSession>, ()> {
+        let pid = ParticipantId(participant_id.to_string());
+        let published_track_ids = rs
+            .meeting
+            .publications
+            .iter()
+            .filter_map(|(track_id, publication)| {
+                if publication.publisher == pid {
+                    Some(track_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        rs.meeting.participants.remove(&pid).ok_or(())?;
+        rs.meeting.subscription_requests.remove(&pid);
+        for subscriptions in rs.meeting.subscription_requests.values_mut() {
+            for track_id in &published_track_ids {
+                subscriptions.remove(track_id);
+            }
+        }
+        rs.meeting.publications.retain(|_, p| p.publisher != pid);
+        for track_id in &published_track_ids {
+            rs.meeting_streams.remove(track_id);
+        }
+        rs.meeting_joined_at.remove(participant_id);
+        Ok(rs.meeting_participants.remove(participant_id))
+    }
+
+    fn remove_broadcast_subscriber_state(
+        rs: &mut RoomState,
+        subscriber_id: &str,
+    ) -> Option<SubscriberSession> {
+        rs.subscribers.remove(subscriber_id)
     }
 
     pub fn meeting_policy_mode(&self, room: RoomId) -> Result<MeetingPolicyMode> {
@@ -678,35 +753,11 @@ impl RoomManager {
             let mut g = self.inner.write();
             let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
-
-            let pid = ParticipantId(participant_id.to_string());
-            let published_track_ids = rs
-                .meeting
-                .publications
-                .iter()
-                .filter_map(|(track_id, publication)| {
-                    if publication.publisher == pid {
-                        Some(track_id.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            rs.meeting.participants.remove(&pid);
-            rs.meeting.subscription_requests.remove(&pid);
-            for subscriptions in rs.meeting.subscription_requests.values_mut() {
-                for track_id in &published_track_ids {
-                    subscriptions.remove(track_id);
-                }
-            }
-            rs.meeting.publications.retain(|_, p| p.publisher != pid);
-            for track_id in &published_track_ids {
-                rs.meeting_streams.remove(track_id);
-            }
+            let participant = Self::remove_meeting_participant_state(rs, participant_id)
+                .map_err(|_| meeting_participant_session_not_found())?;
             rs.meeting.next_revision();
             Self::recompute_meeting_plan(rs);
-            rs.meeting_joined_at.remove(participant_id);
-            rs.meeting_participants.remove(participant_id)
+            participant
         };
 
         if let Some(participant) = participant {
@@ -723,6 +774,13 @@ impl RoomManager {
         revision: u64,
         offer_sdp: String,
     ) -> Result<MeetingSdpResponse> {
+        let span = tracing::info_span!(
+            "meeting_sdp_offer",
+            room = %room.0,
+            participant_id = %participant_id,
+            revision
+        );
+        let _entered = span.enter();
         self.metrics.inc_meeting_sdp_offers();
         let result: Result<MeetingSdpResponse> = async {
             let need_create = {
@@ -785,6 +843,7 @@ impl RoomManager {
                         peer,
                         ice,
                         injector_tx: injector.tx.clone(),
+                        injector_overflow_streak: 0,
                         ssrc_to_mid: HashMap::new(),
                         mid_routing: HashMap::new(),
                         joined_at,
@@ -907,6 +966,171 @@ impl RoomManager {
             .get(participant_id)
             .ok_or_else(meeting_participant_session_not_found)?;
         Ok(participant.ice.drain(max))
+    }
+
+    fn finalize_meeting_forwarding(
+        &self,
+        room: &RoomId,
+        ok_ids: &[String],
+        full_ids: &[String],
+        closed_ids: &[String],
+    ) {
+        let mut evicted = Vec::new();
+        {
+            let mut g = self.inner.write();
+            let Some(rs) = g.rooms.get_mut(room) else {
+                return;
+            };
+            if !matches!(rs.mode, RoomMode::Meeting) {
+                return;
+            }
+
+            for participant_id in ok_ids {
+                if let Some(session) = rs.meeting_participants.get_mut(participant_id) {
+                    session.injector_overflow_streak = 0;
+                }
+            }
+
+            for participant_id in full_ids {
+                let should_evict = rs
+                    .meeting_participants
+                    .get_mut(participant_id)
+                    .map(|session| {
+                        session.injector_overflow_streak += 1;
+                        session.injector_overflow_streak
+                            >= self.config.slow_subscriber_drop_streak_limit
+                    })
+                    .unwrap_or(false);
+                if should_evict
+                    && let Ok(Some(session)) =
+                        Self::remove_meeting_participant_state(rs, participant_id)
+                {
+                    evicted.push((
+                        participant_id.clone(),
+                        EvictionReason::SlowConsumer,
+                        session,
+                    ));
+                }
+            }
+
+            for participant_id in closed_ids {
+                if let Ok(Some(session)) =
+                    Self::remove_meeting_participant_state(rs, participant_id)
+                {
+                    evicted.push((
+                        participant_id.clone(),
+                        EvictionReason::ChannelClosed,
+                        session,
+                    ));
+                }
+            }
+
+            if !evicted.is_empty() {
+                rs.meeting.next_revision();
+                Self::recompute_meeting_plan(rs);
+            }
+        }
+
+        for (participant_id, reason, session) in evicted {
+            self.metrics
+                .inc_subscriber_evictions("meeting", reason.as_label());
+            self.metrics.inc_meeting_leaves();
+            tracing::warn!(
+                room = %room.0,
+                participant_id = %participant_id,
+                cause = reason.as_label(),
+                threshold = self.config.slow_subscriber_drop_streak_limit,
+                "evicting meeting participant from forwarding"
+            );
+            tokio::spawn(async move {
+                if let Err(err) = session.peer.stop().await {
+                    tracing::warn!(
+                        participant_id = %participant_id,
+                        cause = reason.as_label(),
+                        "failed to stop evicted meeting participant peer: {err:#}"
+                    );
+                }
+            });
+        }
+    }
+
+    fn finalize_broadcast_forwarding(
+        &self,
+        room: &RoomId,
+        ok_ids: &[String],
+        full_ids: &[String],
+        closed_ids: &[String],
+    ) {
+        let mut evicted = Vec::new();
+        {
+            let mut g = self.inner.write();
+            let Some(rs) = g.rooms.get_mut(room) else {
+                return;
+            };
+            if !matches!(rs.mode, RoomMode::Broadcast) {
+                return;
+            }
+
+            for subscriber_id in ok_ids {
+                if let Some(session) = rs.subscribers.get_mut(subscriber_id) {
+                    session.injector_overflow_streak = 0;
+                }
+            }
+
+            for subscriber_id in full_ids {
+                let should_evict = rs
+                    .subscribers
+                    .get_mut(subscriber_id)
+                    .map(|session| {
+                        session.injector_overflow_streak += 1;
+                        session.injector_overflow_streak
+                            >= self.config.slow_subscriber_drop_streak_limit
+                    })
+                    .unwrap_or(false);
+                if should_evict
+                    && let Some(session) =
+                        Self::remove_broadcast_subscriber_state(rs, subscriber_id)
+                {
+                    evicted.push((subscriber_id.clone(), EvictionReason::SlowConsumer, session));
+                }
+            }
+
+            for subscriber_id in closed_ids {
+                if let Some(session) = Self::remove_broadcast_subscriber_state(rs, subscriber_id) {
+                    evicted.push((
+                        subscriber_id.clone(),
+                        EvictionReason::ChannelClosed,
+                        session,
+                    ));
+                }
+            }
+
+            if !evicted.is_empty() {
+                Self::recompute_broadcast_graph(rs);
+            }
+        }
+
+        for (subscriber_id, reason, session) in evicted {
+            self.metrics
+                .inc_subscriber_evictions("broadcast", reason.as_label());
+            self.metrics.inc_broadcast_subscribers_stopped();
+            tracing::warn!(
+                room = %room.0,
+                subscriber_id = %subscriber_id,
+                cause = reason.as_label(),
+                threshold = self.config.slow_subscriber_drop_streak_limit,
+                "evicting broadcast subscriber from forwarding"
+            );
+            tokio::spawn(async move {
+                if let Err(err) = session.peer.stop().await {
+                    tracing::warn!(
+                        subscriber_id = %subscriber_id,
+                        cause = reason.as_label(),
+                        "failed to stop evicted broadcast subscriber peer: {err:#}"
+                    );
+                }
+            });
+        }
     }
 
     fn forward_meeting_rtp(&self, room: &RoomId, publisher_id: &str, pkt: RtpPacket) {
@@ -1091,9 +1315,12 @@ impl RoomManager {
             (track_id, targets)
         };
 
+        let mut ok_ids = Vec::new();
+        let mut full_ids = Vec::new();
+        let mut closed_ids = Vec::new();
         for (participant_id, tx) in targets {
             match tx.try_send(pkt.clone()) {
-                Ok(()) => {}
+                Ok(()) => ok_ids.push(participant_id),
                 Err(TrySendError::Full(_)) => {
                     self.metrics.inc_meeting_rtp_dropped("queue_full");
                     tracing::warn!(
@@ -1102,6 +1329,7 @@ impl RoomManager {
                         track_id = %track_id.0,
                         "dropping meeting RTP packet because subscriber injector queue is full"
                     );
+                    full_ids.push(participant_id);
                 }
                 Err(TrySendError::Closed(_)) => {
                     self.metrics.inc_meeting_rtp_dropped("channel_closed");
@@ -1111,9 +1339,11 @@ impl RoomManager {
                         track_id = %track_id.0,
                         "meeting subscriber injector channel closed"
                     );
+                    closed_ids.push(participant_id);
                 }
             }
         }
+        self.finalize_meeting_forwarding(room, &ok_ids, &full_ids, &closed_ids);
     }
 
     fn schedule_meeting_keyframe_warmup(&self, room: RoomId, publisher_id: String) {
@@ -1183,7 +1413,7 @@ impl RoomManager {
                                 );
                             sess.first_video_keyframe_forwarded = true;
                         }
-                        Some(sess.injector_tx.clone())
+                        Some((forwarding.subscriber_id.0.clone(), sess.injector_tx.clone()))
                     }
                     _ => None,
                 })
@@ -1191,7 +1421,10 @@ impl RoomManager {
             (targets, track_id.0)
         };
 
-        for target in targets {
+        let mut ok_ids = Vec::new();
+        let mut full_ids = Vec::new();
+        let mut closed_ids = Vec::new();
+        for (subscriber_id, target) in targets {
             if let Err(err) = target.try_send(pkt.clone()) {
                 match err {
                     TrySendError::Full(_) => {
@@ -1199,15 +1432,21 @@ impl RoomManager {
                         tracing::warn!(
                             room = %room.0,
                             stream = %stream_key,
+                            subscriber_id = %subscriber_id,
                             "dropping broadcast RTP packet because subscriber injector queue is full"
                         );
+                        full_ids.push(subscriber_id);
                     }
                     TrySendError::Closed(_) => {
                         self.metrics.inc_broadcast_rtp_dropped("channel_closed");
+                        closed_ids.push(subscriber_id);
                     }
                 }
+            } else {
+                ok_ids.push(subscriber_id);
             }
         }
+        self.finalize_broadcast_forwarding(room, &ok_ids, &full_ids, &closed_ids);
     }
 
     async fn request_meeting_participant_keyframe(
@@ -1242,6 +1481,8 @@ impl RoomManager {
 
     /// POST /whip/:room  (offer SDP -> answer SDP)
     pub async fn whip_publish(&self, room: RoomId, offer_sdp: String) -> Result<SdpResponse> {
+        let span = tracing::info_span!("broadcast_whip_publish", room = %room.0);
+        let _entered = span.enter();
         let result: Result<SdpResponse> = async {
             let pub_id = Uuid::new_v4().to_string();
 
@@ -1384,6 +1625,8 @@ impl RoomManager {
 
     /// POST /whep/:room  (offer SDP -> answer SDP)
     pub async fn whep_subscribe(&self, room: RoomId, offer_sdp: String) -> Result<SdpResponse> {
+        let span = tracing::info_span!("broadcast_whep_subscribe", room = %room.0);
+        let _entered = span.enter();
         let result: Result<SdpResponse> = async {
             let sub_id = Uuid::new_v4().to_string();
 
@@ -1451,6 +1694,7 @@ impl RoomManager {
                         peer,
                         ice,
                         injector_tx: injector.tx.clone(),
+                        injector_overflow_streak: 0,
                         subscribed_at: Instant::now(),
                         first_rtp_forwarded: false,
                         first_video_keyframe_forwarded: false,
@@ -1532,9 +1776,7 @@ impl RoomManager {
             let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
 
-            let sub = rs
-                .subscribers
-                .remove(sub_id)
+            let sub = Self::remove_broadcast_subscriber_state(rs, sub_id)
                 .ok_or_else(subscriber_not_found)?;
             Self::recompute_broadcast_graph(rs);
             sub
@@ -1900,10 +2142,39 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use gstreamer as gst;
+    use tokio::sync::mpsc;
 
     fn manager() -> RoomManager {
         let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
         RoomManager::new(gst)
+    }
+
+    async fn test_peer(manager: &RoomManager, peer_id: &str, role: PeerRole) -> PeerSession {
+        let peer = PeerSession::new(manager.gst.clone(), peer_id.to_string(), role, None)
+            .await
+            .expect("peer must be created");
+        peer.start().await.expect("peer must start");
+        peer
+    }
+
+    fn test_video_packet() -> RtpPacket {
+        RtpPacket {
+            pad_name: "src_0".to_string(),
+            caps: gst::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", "VP8")
+                .build(),
+            data: Bytes::from_static(&[]),
+            meta: media::RtpMeta {
+                ssrc: Some(0x1122_3344),
+                sequence_number: Some(1),
+                timestamp: Some(1),
+                temporal_layer: Some(0),
+            },
+            pts: None,
+            dts: None,
+            duration: None,
+        }
     }
 
     fn publish_tracks() -> Vec<MeetingPublishTrack> {
@@ -2090,6 +2361,109 @@ mod tests {
         assert_eq!(streams[0].mid, None);
         assert_eq!(streams[0].rid, None);
         assert_eq!(streams[0].spatial_layer, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_slow_consumer_is_evicted_after_sustained_overflow() {
+        let manager = manager();
+        let room = RoomId("meeting-overload".to_string());
+        join_publish_and_subscribe(&manager, &room);
+
+        let peer = test_peer(&manager, "bob-peer", PeerRole::MeetingParticipant).await;
+        let (tx, _rx) = mpsc::channel(1);
+        {
+            let mut g = manager.inner.write();
+            let rs = g.rooms.get_mut(&room).expect("room must exist");
+            rs.meeting_participants.insert(
+                "bob".to_string(),
+                MeetingParticipantSession {
+                    id: "bob".to_string(),
+                    peer,
+                    ice: IceQueue::new(),
+                    injector_tx: tx,
+                    injector_overflow_streak: 0,
+                    ssrc_to_mid: HashMap::new(),
+                    mid_routing: HashMap::new(),
+                    joined_at: Instant::now(),
+                    first_join_rtp_forwarded: false,
+                    first_join_video_keyframe_forwarded: false,
+                    subscribe_started_at: None,
+                    subscribe_keyframe_started_at: None,
+                },
+            );
+        }
+
+        for _ in 0..=manager.config.slow_subscriber_drop_streak_limit {
+            manager.forward_meeting_rtp(&room, "alice", test_video_packet());
+        }
+        tokio::task::yield_now().await;
+
+        let participants = manager
+            .meeting_list_participants(room.clone())
+            .expect("participants should still be listable");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].participant_id, "alice");
+        assert!(
+            manager
+                .meeting_list_subscription_requests(room.clone(), "bob")
+                .is_err()
+        );
+
+        let rendered = manager.render_metrics();
+        assert!(rendered.contains(
+            "narwhal_subscriber_evictions_total{mode=\"meeting\",reason=\"slow_consumer\"} 1"
+        ));
+        assert!(rendered.contains("narwhal_meeting_leaves_total 1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn broadcast_slow_consumer_is_evicted_after_sustained_overflow() {
+        let manager = manager();
+        let room = RoomId("broadcast-overload".to_string());
+        let publisher_peer = test_peer(&manager, "pub-peer", PeerRole::WhipPublisher).await;
+        let subscriber_peer = test_peer(&manager, "sub-peer", PeerRole::WhepSubscriber).await;
+        let (tx, _rx) = mpsc::channel(1);
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Broadcast;
+            rs.publisher = Some(PublisherSession {
+                id: "publisher".to_string(),
+                peer: publisher_peer,
+                ice: IceQueue::new(),
+            });
+            rs.subscribers.insert(
+                "subscriber".to_string(),
+                SubscriberSession {
+                    id: "subscriber".to_string(),
+                    peer: subscriber_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: tx,
+                    injector_overflow_streak: 0,
+                    subscribed_at: Instant::now(),
+                    first_rtp_forwarded: false,
+                    first_video_keyframe_forwarded: false,
+                },
+            );
+            RoomManager::recompute_broadcast_graph(rs);
+        }
+
+        for _ in 0..=manager.config.slow_subscriber_drop_streak_limit {
+            manager.forward_broadcast_rtp(&room, test_video_packet());
+        }
+        tokio::task::yield_now().await;
+
+        let inspection = manager
+            .broadcast_inspect(room.clone())
+            .expect("broadcast inspection should succeed");
+        assert!(inspection.subscriber_ids.is_empty());
+
+        let rendered = manager.render_metrics();
+        assert!(rendered.contains(
+            "narwhal_subscriber_evictions_total{mode=\"broadcast\",reason=\"slow_consumer\"} 1"
+        ));
+        assert!(rendered.contains("narwhal_broadcast_subscribers_stopped_total 1"));
     }
 
     #[test]

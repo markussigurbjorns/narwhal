@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{env, net::SocketAddr};
 
 use anyhow::Result;
 use axum::{
@@ -8,14 +8,14 @@ use axum::{
     routing::get,
 };
 use media::GstRuntime;
-use narwhal_core::RoomManager;
+use narwhal_core::{RoomManager, RoomManagerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let gst = GstRuntime::init()?;
-    let rooms = RoomManager::new(gst);
+    let rooms = RoomManager::with_config(gst, room_manager_config()?);
 
     let app = server::app(rooms).merge(clients_routes());
 
@@ -26,6 +26,25 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn room_manager_config() -> Result<RoomManagerConfig> {
+    Ok(RoomManagerConfig {
+        slow_subscriber_drop_streak_limit: parse_env_u32(
+            "NARWHAL_SLOW_SUBSCRIBER_DROP_STREAK_LIMIT",
+            RoomManagerConfig::default().slow_subscriber_drop_streak_limit,
+        )?,
+    })
+}
+
+fn parse_env_u32(name: &str, default: u32) -> Result<u32> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .map_err(|err| anyhow::anyhow!("{name} must be a u32: {err}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(anyhow::anyhow!("failed to read {name}: {err}")),
+    }
 }
 
 fn clients_routes() -> Router {

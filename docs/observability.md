@@ -143,6 +143,46 @@ These are transition counters, not live-state gauges.
 - `queue_full`
 - `channel_closed`
 
+## Overload And Eviction
+
+Narwhal forwards RTP by pushing cloned packets into a bounded per-subscriber injector queue.
+
+That means overload in the current system does not mean "the whole process is out of CPU". It means a specific downstream subscriber or meeting participant is not draining forwarded RTP fast enough. When that happens:
+
+1. `try_send` to that subscriber's injector queue starts failing with `queue_full`
+2. the packet is dropped for that subscriber only
+3. a consecutive overflow streak is tracked for that subscriber
+4. once the streak reaches the configured threshold, that subscriber is evicted and its peer is stopped
+
+This is a containment mechanism. The goal is to stop one persistently slow consumer from accumulating unbounded queue pressure or stalling forwarding work for the rest of the room.
+
+Current eviction policy:
+
+- threshold is controlled by `NARWHAL_SLOW_SUBSCRIBER_DROP_STREAK_LIMIT`
+- default is `64`
+- successful packet delivery resets the overflow streak
+- a closed injector channel causes immediate eviction
+
+Metrics for this behavior:
+
+- `narwhal_rtp_dropped_total{mode,reason}`
+  - `reason="queue_full"` means packets were dropped because the subscriber queue was already full
+  - `reason="channel_closed"` means forwarding attempted to a closed injector
+- `narwhal_subscriber_evictions_total{mode,reason}`
+  - Counter. Subscribers or meeting participants removed from forwarding because delivery could not be sustained
+
+`narwhal_subscriber_evictions_total{mode,reason}` values currently include:
+
+- `mode="meeting"` or `mode="broadcast"`
+- `reason="slow_consumer"`
+- `reason="channel_closed"`
+
+Operational interpretation:
+
+- rising `queue_full` with no evictions means subscribers are briefly falling behind but recovering
+- rising `queue_full` followed by `slow_consumer` evictions means the threshold is being hit and users are being disconnected
+- `channel_closed` evictions usually indicate teardown races or stale forwarding state rather than bandwidth pressure
+
 ## First-Media Histograms
 
 All timing histograms are measured in seconds.

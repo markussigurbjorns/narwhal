@@ -410,6 +410,111 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_returns_not_found_when_room_is_missing() {
+        let response = app(manager())
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/missing-room")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from("dummy-offer"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "room not found");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_returns_not_found_when_no_publisher_exists() {
+        let rooms = manager();
+        rooms.ensure_room_mode(
+            RoomId("broadcast-no-publisher".to_string()),
+            RoomMode::Broadcast,
+        );
+
+        let response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/broadcast-no-publisher")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from("dummy-offer"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "no publisher");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_returns_conflict_for_meeting_room() {
+        let rooms = manager();
+        rooms.ensure_room_mode(RoomId("meeting-whep".to_string()), RoomMode::Meeting);
+
+        let response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/meeting-whep")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from("dummy-offer"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json["error"],
+            "room is in meeting mode; WHIP/WHEP broadcast endpoints are not available"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whip_ice_endpoint_returns_conflict_for_meeting_room() {
+        let rooms = manager();
+        rooms.ensure_room_mode(RoomId("meeting-whip-ice".to_string()), RoomMode::Meeting);
+
+        let response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/meeting-whip-ice/publisher-1/ice")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json["error"],
+            "room is in meeting mode; WHIP/WHEP broadcast endpoints are not available"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn metrics_endpoint_reflects_room_activity_and_failure_labels() {
         let rooms = manager();
 

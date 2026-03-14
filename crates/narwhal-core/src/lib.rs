@@ -29,6 +29,7 @@ pub use policy::{
 pub use room::{
     BroadcastGraphEdgeInfo, BroadcastInspection, BroadcastStreamInfo, BroadcastSubscriberPlanInfo,
     BroadcastVideoSelectionInfo, MeetingParticipantInfo, MeetingPublicationInfo,
-    MeetingPublishTrack, MeetingSdpResponse, MeetingStreamInfo, RoomId, RoomManager, SdpResponse,
+    MeetingPublishTrack, MeetingSdpResponse, MeetingStreamInfo, RoomId, RoomManager,
+    RoomManagerConfig, SdpResponse,
 };
 pub use session::{MeetingParticipantSession, MidRoutingInfo, PublisherSession, SubscriberSession};

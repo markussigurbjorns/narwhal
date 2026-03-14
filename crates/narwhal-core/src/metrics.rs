@@ -31,6 +31,7 @@ pub struct AppMetrics {
     broadcast_whep_trickle_ice_total: IntCounter,
     broadcast_rtp_dropped_total: IntCounter,
     rtp_dropped_total: IntCounterVec,
+    subscriber_evictions_total: IntCounterVec,
     negotiation_total: IntCounterVec,
     peer_state_transitions_total: IntCounterVec,
     broadcast_subscribe_to_first_rtp_seconds: Histogram,
@@ -231,6 +232,17 @@ impl AppMetrics {
             )
             .unwrap(),
         );
+        let subscriber_evictions_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "narwhal_subscriber_evictions_total",
+                    "Subscribers or participants evicted from forwarding because delivery could not be sustained.",
+                ),
+                &["mode", "reason"],
+            )
+            .unwrap(),
+        );
         let negotiation_total = register(
             &registry,
             IntCounterVec::new(
@@ -321,6 +333,7 @@ impl AppMetrics {
             broadcast_whep_trickle_ice_total,
             broadcast_rtp_dropped_total,
             rtp_dropped_total,
+            subscriber_evictions_total,
             negotiation_total,
             peer_state_transitions_total,
             broadcast_subscribe_to_first_rtp_seconds,
@@ -406,6 +419,12 @@ impl AppMetrics {
         let outcome = if success { "success" } else { "failure" };
         self.negotiation_total
             .with_label_values(&[flow, outcome, cause])
+            .inc();
+    }
+
+    pub fn inc_subscriber_evictions(&self, mode: &str, reason: &str) {
+        self.subscriber_evictions_total
+            .with_label_values(&[mode, reason])
             .inc();
     }
 
@@ -506,6 +525,7 @@ mod tests {
         let metrics = AppMetrics::default();
         metrics.observe_negotiation("meeting_sdp_offer", false, "room_not_found");
         metrics.inc_meeting_rtp_dropped("queue_full");
+        metrics.inc_subscriber_evictions("meeting", "slow_consumer");
         metrics.observe_meeting_join_to_first_rtp(Duration::from_millis(150));
 
         let rendered = metrics.render_prometheus(StateSnapshot {
@@ -528,6 +548,9 @@ mod tests {
             rendered
                 .contains("narwhal_rtp_dropped_total{mode=\"meeting\",reason=\"queue_full\"} 1")
         );
+        assert!(rendered.contains(
+            "narwhal_subscriber_evictions_total{mode=\"meeting\",reason=\"slow_consumer\"} 1"
+        ));
         assert!(rendered.contains("narwhal_meeting_join_to_first_rtp_seconds_bucket"));
     }
 }
