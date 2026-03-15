@@ -14,13 +14,11 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::AppState;
 use crate::errors::TransportError;
 
-pub async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(rooms): State<RoomManager>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, rooms))
+pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms()))
 }
 
 struct SessionState {

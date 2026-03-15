@@ -10,12 +10,94 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use self::errors::TransportError;
 use narwhal_core::{BroadcastPolicyMode, RoomId, RoomManager};
 
+#[derive(Clone)]
+pub struct AppState {
+    rooms: RoomManager,
+    ready: Arc<AtomicBool>,
+    readiness_cache: Arc<Mutex<Option<ReadinessCacheEntry>>>,
+    readiness_cache_ttl: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct ReadinessCacheEntry {
+    checked_at: Instant,
+    ready: bool,
+}
+
+impl AppState {
+    pub fn new(rooms: RoomManager) -> Self {
+        Self::with_readiness_cache_ttl(rooms, Duration::from_secs(1))
+    }
+
+    pub fn with_readiness_cache_ttl(rooms: RoomManager, readiness_cache_ttl: Duration) -> Self {
+        Self {
+            rooms,
+            ready: Arc::new(AtomicBool::new(true)),
+            readiness_cache: Arc::new(Mutex::new(None)),
+            readiness_cache_ttl,
+        }
+    }
+
+    pub fn rooms(&self) -> RoomManager {
+        self.rooms.clone()
+    }
+
+    pub fn mark_draining(&self) {
+        self.ready.store(false, Ordering::SeqCst);
+        if let Ok(mut cache) = self.readiness_cache.lock() {
+            *cache = Some(ReadinessCacheEntry {
+                checked_at: Instant::now(),
+                ready: false,
+            });
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    pub async fn readiness(&self) -> bool {
+        if !self.is_ready() {
+            return false;
+        }
+
+        if let Ok(cache) = self.readiness_cache.lock()
+            && let Some(entry) = *cache
+            && entry.checked_at.elapsed() < self.readiness_cache_ttl
+        {
+            return entry.ready;
+        }
+
+        let ready = self.rooms.probe_media_ready().await.is_ok();
+        if let Ok(mut cache) = self.readiness_cache.lock() {
+            *cache = Some(ReadinessCacheEntry {
+                checked_at: Instant::now(),
+                ready,
+            });
+        }
+        ready
+    }
+}
+
 pub fn app(rooms: RoomManager) -> Router {
+    app_with_state(AppState::new(rooms))
+}
+
+pub fn app_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(get_health))
+        .route("/readyz", get(get_ready))
         .route("/whip/{room}", post(whip_post))
         .route("/whip/{room}/{pub}/ice", get(whip_get_ice))
         .route("/whip/{room}/{pub}", delete(whip_delete).patch(whip_patch))
@@ -32,7 +114,15 @@ pub fn app(rooms: RoomManager) -> Router {
         )
         .route("/metrics", get(get_metrics))
         .route("/ws", get(ws::ws_upgrade))
-        .with_state(rooms)
+        .with_state(state)
+}
+
+async fn get_health() -> impl IntoResponse {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+async fn get_ready(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({ "ready": state.readiness().await }))
 }
 
 #[derive(Deserialize)]
@@ -84,7 +174,7 @@ fn broadcast_policy_mode_label(mode: BroadcastPolicyMode) -> &'static str {
 }
 
 async fn whip_post(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path(room): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -93,7 +183,7 @@ async fn whip_post(
         Err(_) => return TransportError::invalid_request("invalid utf8 SDP").into_response(),
     };
 
-    match rooms.whip_publish(RoomId(room), offer_sdp).await {
+    match state.rooms().whip_publish(RoomId(room), offer_sdp).await {
         Ok(res) => {
             let mut h = HeaderMap::new();
             h.insert("content-type", "application/sdp".parse().unwrap());
@@ -105,7 +195,7 @@ async fn whip_post(
 }
 
 async fn whep_post(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path(room): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -114,7 +204,7 @@ async fn whep_post(
         Err(_) => return TransportError::invalid_request("invalid utf8 SDP").into_response(),
     };
 
-    match rooms.whep_subscribe(RoomId(room), offer_sdp).await {
+    match state.rooms().whep_subscribe(RoomId(room), offer_sdp).await {
         Ok(res) => {
             let mut h = HeaderMap::new();
             h.insert("content-type", "application/sdp".parse().unwrap());
@@ -126,11 +216,12 @@ async fn whep_post(
 }
 
 async fn whip_patch(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path((room, pub_id)): Path<(String, String)>,
     Json(payload): Json<IceIn>,
 ) -> impl IntoResponse {
-    match rooms
+    match state
+        .rooms()
         .whip_trickle(
             RoomId(room),
             &pub_id,
@@ -145,11 +236,12 @@ async fn whip_patch(
 }
 
 async fn whep_patch(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path((room, sub_id)): Path<(String, String)>,
     Json(payload): Json<IceIn>,
 ) -> impl IntoResponse {
-    match rooms
+    match state
+        .rooms()
         .whep_trickle(
             RoomId(room),
             &sub_id,
@@ -164,10 +256,10 @@ async fn whep_patch(
 }
 
 async fn whip_get_ice(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path((room, pub_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match rooms.whip_drain_ice(RoomId(room), &pub_id, 50) {
+    match state.rooms().whip_drain_ice(RoomId(room), &pub_id, 50) {
         Ok(list) => {
             let out: Vec<IceOut> = list
                 .into_iter()
@@ -183,10 +275,10 @@ async fn whip_get_ice(
 }
 
 async fn whep_get_ice(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path((room, sub_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match rooms.whep_drain_ice(RoomId(room), &sub_id, 50) {
+    match state.rooms().whep_drain_ice(RoomId(room), &sub_id, 50) {
         Ok(list) => {
             let out: Vec<IceOut> = list
                 .into_iter()
@@ -202,30 +294,30 @@ async fn whep_get_ice(
 }
 
 async fn whip_delete(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path((room, pub_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match rooms.whip_stop(RoomId(room), &pub_id).await {
+    match state.rooms().whip_stop(RoomId(room), &pub_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => TransportError::from_anyhow(e).into_response(),
     }
 }
 
 async fn whep_delete(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path((room, sub_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match rooms.whep_stop(RoomId(room), &sub_id).await {
+    match state.rooms().whep_stop(RoomId(room), &sub_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => TransportError::from_anyhow(e).into_response(),
     }
 }
 
 async fn get_broadcast_policy_mode(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path(room): Path<String>,
 ) -> impl IntoResponse {
-    match rooms.broadcast_policy_mode(RoomId(room)) {
+    match state.rooms().broadcast_policy_mode(RoomId(room)) {
         Ok(mode) => Json(BroadcastPolicyModeOut {
             mode: broadcast_policy_mode_label(mode),
         })
@@ -235,12 +327,12 @@ async fn get_broadcast_policy_mode(
 }
 
 async fn set_broadcast_policy_mode(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path(room): Path<String>,
     Json(payload): Json<SetBroadcastPolicyModeIn>,
 ) -> impl IntoResponse {
     let mode: BroadcastPolicyMode = payload.mode.into();
-    match rooms.broadcast_set_policy_mode(RoomId(room), mode) {
+    match state.rooms().broadcast_set_policy_mode(RoomId(room), mode) {
         Ok(()) => Json(BroadcastPolicyModeOut {
             mode: broadcast_policy_mode_label(mode),
         })
@@ -250,10 +342,10 @@ async fn set_broadcast_policy_mode(
 }
 
 async fn get_broadcast_inspection(
-    State(rooms): State<RoomManager>,
+    State(state): State<AppState>,
     Path(room): Path<String>,
 ) -> impl IntoResponse {
-    match rooms.broadcast_inspect(RoomId(room)) {
+    match state.rooms().broadcast_inspect(RoomId(room)) {
         Ok(info) => Json(serde_json::json!({
             "mode": broadcast_policy_mode_label(info.policy_mode),
             "publisher_id": info.publisher_id,
@@ -290,18 +382,18 @@ async fn get_broadcast_inspection(
     }
 }
 
-async fn get_metrics(State(rooms): State<RoomManager>) -> impl IntoResponse {
+async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
-    (StatusCode::OK, headers, rooms.render_metrics())
+    (StatusCode::OK, headers, state.rooms().render_metrics())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{app, get_metrics};
+    use super::{AppState, app, app_with_state, get_metrics};
     use axum::{
         body::{Body, to_bytes},
         extract::State,
@@ -408,7 +500,9 @@ a=ssrc:5678 msid:test video0\r\n"
 
     #[tokio::test(flavor = "current_thread")]
     async fn metrics_endpoint_returns_prometheus_payload() {
-        let response = get_metrics(State(manager())).await.into_response();
+        let response = get_metrics(State(AppState::new(manager())))
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -423,6 +517,72 @@ a=ssrc:5678 msid:test video0\r\n"
 
         assert!(body.contains("narwhal_rooms_total"));
         assert!(body.contains("narwhal_meeting_joins_total"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_endpoint_returns_ok() {
+        let response = app(manager())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json, json!({ "ok": true }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readiness_endpoint_returns_ready() {
+        let response = app(manager())
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json, json!({ "ready": true }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readiness_endpoint_returns_false_when_draining() {
+        let state = AppState::new(manager());
+        state.mark_draining();
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json, json!({ "ready": false }));
     }
 
     #[tokio::test(flavor = "current_thread")]

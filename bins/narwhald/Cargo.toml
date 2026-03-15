@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 axum = "0.8.8"
-tokio = {version = "1.49.0", features = ["rt-multi-thread", "macros"] }
+tokio = {version = "1.49.0", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = "0.3.22"
 
 media = { path = "../../crates/media" }

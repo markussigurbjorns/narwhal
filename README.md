@@ -46,6 +46,11 @@ Metrics are exposed at:
 
 - `/metrics`
 
+Health endpoints:
+
+- `/healthz`
+- `/readyz`
+
 ## Development Notes
 
 Project scope:

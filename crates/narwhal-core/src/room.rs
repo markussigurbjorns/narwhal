@@ -19,6 +19,7 @@ use std::{
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, sleep};
+use tracing::warn;
 use uuid::Uuid;
 
 const DEFAULT_SLOW_SUBSCRIBER_DROP_STREAK_LIMIT: u32 = 64;
@@ -201,6 +202,44 @@ impl RoomManager {
 
     pub fn render_metrics(&self) -> String {
         self.metrics.render_prometheus(self.state_snapshot())
+    }
+
+    pub async fn probe_media_ready(&self) -> Result<()> {
+        let peer = PeerSession::new(
+            self.gst.clone(),
+            "readiness-probe".to_string(),
+            PeerRole::MeetingParticipant,
+            None,
+        )
+        .await?;
+        peer.start().await?;
+        peer.stop().await?;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        let peers = {
+            let mut g = self.inner.write();
+            let mut peers = Vec::new();
+            for (_, mut room) in g.rooms.drain() {
+                if let Some(publisher) = room.publisher.take() {
+                    peers.push(("broadcast_publisher", publisher.id, publisher.peer));
+                }
+                for (_, subscriber) in room.subscribers.drain() {
+                    peers.push(("broadcast_subscriber", subscriber.id, subscriber.peer));
+                }
+                for (_, participant) in room.meeting_participants.drain() {
+                    peers.push(("meeting_participant", participant.id, participant.peer));
+                }
+            }
+            peers
+        };
+
+        for (role, id, peer) in peers {
+            if let Err(err) = peer.stop().await {
+                warn!(role, peer_id = %id, "failed to stop peer during shutdown: {err:#}");
+            }
+        }
     }
 
     fn state_snapshot(&self) -> StateSnapshot {

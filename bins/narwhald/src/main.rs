@@ -9,21 +9,36 @@ use axum::{
 };
 use media::GstRuntime;
 use narwhal_core::{RoomManager, RoomManagerConfig};
+use server::AppState;
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let gst = GstRuntime::init()?;
-    let rooms = RoomManager::with_config(gst, room_manager_config()?);
+    let room_manager_config = room_manager_config()?;
+    let shutdown_drain_secs = parse_env_u64("NARWHAL_SHUTDOWN_DRAIN_SECS", 10)?;
+    tracing::info!(
+        slow_subscriber_drop_streak_limit = room_manager_config.slow_subscriber_drop_streak_limit,
+        shutdown_drain_secs,
+        "loaded room manager config"
+    );
+    let rooms = RoomManager::with_config(gst, room_manager_config);
+    let state = AppState::new(rooms);
 
-    let app = server::app(rooms).merge(clients_routes());
+    let app = server::app_with_state(state.clone()).merge(clients_routes());
 
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
     tracing::info!("listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(
+            state,
+            Duration::from_secs(shutdown_drain_secs),
+        ))
+        .await?;
 
     Ok(())
 }
@@ -44,6 +59,48 @@ fn parse_env_u32(name: &str, default: u32) -> Result<u32> {
             .map_err(|err| anyhow::anyhow!("{name} must be a u32: {err}")),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(err) => Err(anyhow::anyhow!("failed to read {name}: {err}")),
+    }
+}
+
+fn parse_env_u64(name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|err| anyhow::anyhow!("{name} must be a u64: {err}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(anyhow::anyhow!("failed to read {name}: {err}")),
+    }
+}
+
+async fn shutdown_signal(state: AppState, drain_duration: Duration) {
+    wait_for_shutdown_signal().await;
+    tracing::info!(
+        drain_secs = drain_duration.as_secs(),
+        "shutdown signal received; entering drain mode"
+    );
+    state.mark_draining();
+    sleep(drain_duration).await;
+    tracing::info!("drain window elapsed; stopping active peers");
+    state.rooms().shutdown().await;
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
     }
 }
 
