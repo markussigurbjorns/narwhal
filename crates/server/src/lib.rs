@@ -453,6 +453,40 @@ a=ssrc:5678 msid:test video0\r\n"
             .to_string()
     }
 
+    fn browser_like_subscribe_offer_sdp() -> String {
+        "\
+v=0\r\n\
+o=- 4611733055804614138 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:subufrag\r\n\
+a=ice-pwd:subpassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=recvonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:subufrag\r\n\
+a=ice-pwd:subpassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=recvonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n"
+            .to_string()
+    }
+
     async fn spawn_ws_app(
         rooms: RoomManager,
     ) -> std::io::Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)> {
@@ -706,6 +740,133 @@ a=ssrc:5678 msid:test video0\r\n"
             .expect("body readable");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json["error"], "no publisher");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whip_post_accepts_browser_like_sdp_offer() {
+        let response = app(manager())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whip-ok")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/sdp"
+        );
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8");
+        assert!(location.starts_with("/whip/broadcast-whip-ok/"));
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
+        assert!(answer.contains("m=audio"));
+        assert!(answer.contains("m=video"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_returns_unprocessable_with_real_sdp_when_publisher_not_flowing() {
+        let rooms = manager();
+        let publisher_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-not-flowing")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(publisher_response.status(), StatusCode::CREATED);
+
+        let response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/broadcast-not-flowing")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json["error"],
+            "publisher has not produced RTP yet; try subscribing after media is flowing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_accepts_browser_like_sdp_when_streams_are_seeded() {
+        let rooms = manager();
+        let publisher_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whep-ok")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(publisher_response.status(), StatusCode::CREATED);
+
+        rooms
+            .seed_broadcast_streams_for_test(RoomId("broadcast-whep-ok".to_string()))
+            .expect("seeded broadcast streams");
+
+        let response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/broadcast-whep-ok")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/sdp"
+        );
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8");
+        assert!(location.starts_with("/whep/broadcast-whep-ok/"));
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
+        assert!(answer.contains("m=audio"));
+        assert!(answer.contains("m=video"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -159,8 +159,8 @@
   ✓ stale revision rejection and recovery
   - disconnect during negotiation
   ✓ reconnect after WebSocket loss
-  ~ join while publisher already active
-  ~ publisher replace/restart case
+  ✓ join while publisher already active
+  ✓ publisher replace/restart case
   - TURN-only connectivity case
 
   Deliverables:
@@ -219,8 +219,8 @@
   Work:
 
   ~ config file/env model for ports, TURN, limits, timeouts, metrics
-  - health and readiness endpoints
-  - graceful shutdown with room draining
+  ✓ health and readiness endpoints
+  ✓ graceful shutdown with room draining
   - container image and systemd/Kubernetes examples
   - log formatting and log shipping guidance
   - TLS termination assumptions documented
@@ -230,7 +230,7 @@
 
   - docs/deploy.md
   ✓ docs/config.md
-  - health endpoints and shutdown handling
+  ✓ health endpoints and shutdown handling
 
   Exit criteria:
 

@@ -6,6 +6,7 @@ use crate::{
     start_ice_collector,
 };
 use anyhow::Result;
+use gstreamer as gst;
 use media::{
     GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket, RtpStreamInfo,
     is_probable_video_keyframe, stream_info,
@@ -785,6 +786,37 @@ impl RoomManager {
             subscriber_plans,
             graph_edges,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn seed_broadcast_streams_for_test(&self, room: RoomId) -> Result<()> {
+        let mut g = self.inner.write();
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
+        Self::require_broadcast_mode(rs)?;
+        rs.publisher.as_ref().ok_or_else(no_publisher)?;
+
+        rs.broadcast_streams.insert(
+            "audio".to_string(),
+            RtpStreamInfo {
+                media_key: "audio".to_string(),
+                caps: gst::Caps::builder("application/x-rtp")
+                    .field("media", "audio")
+                    .field("encoding-name", "OPUS")
+                    .build(),
+            },
+        );
+        rs.broadcast_streams.insert(
+            "video".to_string(),
+            RtpStreamInfo {
+                media_key: "video".to_string(),
+                caps: gst::Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .field("encoding-name", "VP8")
+                    .build(),
+            },
+        );
+
+        Ok(())
     }
 
     pub async fn meeting_leave(&self, room: RoomId, participant_id: &str) -> Result<()> {
