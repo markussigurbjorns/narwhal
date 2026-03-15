@@ -281,6 +281,8 @@ Current model:
 
 - one WebSocket session corresponds to at most one joined meeting participant
 - the server assigns the participant ID
+- if the WebSocket closes, the server treats that as participant leave
+- reconnect is currently a fresh join, not session resume
 
 ### JSON-RPC Envelope
 
@@ -352,6 +354,7 @@ Current behavior:
 - if the room does not exist, it is created and switched to meeting mode
 - if the room is already in broadcast mode, join fails
 - if the WebSocket session already joined, join fails
+- reconnecting after disconnect creates a new participant ID
 
 #### `leave`
 
@@ -462,6 +465,11 @@ Success result:
 }
 ```
 
+Current behavior:
+
+- publishing increments room revision
+- the API currently still reports `needs_renegotiation: false`
+
 #### `unpublish_tracks`
 
 Params:
@@ -504,6 +512,8 @@ Notes:
 
 - requested tracks are validated against currently known publications
 - subscription policy may reduce the effective set relative to the requested set
+- subscribing increments room revision
+- the API currently still reports `needs_renegotiation: false`
 
 #### `unsubscribe`
 
@@ -523,6 +533,11 @@ Success result:
   "needs_renegotiation": false
 }
 ```
+
+Current behavior:
+
+- unsubscribing increments room revision
+- the API currently still reports `needs_renegotiation: false`
 
 #### `list_participants`
 
@@ -631,6 +646,8 @@ Current behavior:
 - `join` returns the current revision after participant insertion
 - mutating operations such as publish, unpublish, subscribe, unsubscribe, and policy changes increment the revision
 - `sdp_offer` rejects revisions greater than the current room revision
+- when a publisher leaves, their publications are removed and other participants' requested/effective subscriptions are pruned accordingly
+- if that publisher rejoins later, they are a new session and remote participants must subscribe again to the newly published track IDs
 
 Current limitation:
 

@@ -184,6 +184,10 @@ async fn handle_socket(mut socket: WebSocket, rooms: RoomManager) {
         }
     }
 
+    cleanup_joined_session(&mut state).await;
+}
+
+async fn cleanup_joined_session(state: &mut SessionState) {
     if let Some(joined) = state.joined.take() {
         if let Err(err) = state
             .rooms
@@ -680,16 +684,56 @@ fn rpc_core_error(err: CoreError) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::{
-        JoinedParticipant, SessionState, handle_text, join, leave, publish_tracks, sdp_offer,
-        subscribe,
+        JoinedParticipant, SessionState, cleanup_joined_session, handle_text, join, leave,
+        list_participants, list_subscriptions, publish_tracks, sdp_offer, subscribe, unsubscribe,
     };
     use media::GstRuntime;
-    use narwhal_core::{RoomId, RoomManager};
+    use narwhal_core::{MediaKind, MeetingPublishTrack, RoomId, RoomManager};
     use serde_json::json;
 
     fn manager() -> RoomManager {
         let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
         RoomManager::new(gst)
+    }
+
+    fn browser_like_offer_sdp() -> String {
+        "\
+v=0\r\n\
+o=- 4611733055804614137 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:1234 cname:test\r\n\
+a=ssrc:1234 msid:test audio0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=ssrc:5678 cname:test\r\n\
+a=ssrc:5678 msid:test video0\r\n"
+            .to_string()
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -852,5 +896,648 @@ mod tests {
 
         assert_eq!(err.code, 4220);
         assert_eq!(err.message, "invalid future revision: got 101, current 1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdp_offer_accepts_current_revision_with_browser_like_offer() {
+        let rooms = manager();
+        let room = RoomId("meeting-current-sdp".to_string());
+        let revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(JoinedParticipant {
+                room,
+                participant_id: "alice".to_string(),
+                revision,
+            }),
+        };
+
+        let result = sdp_offer(
+            &mut state,
+            json!({
+                "revision": revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("current revision offer should negotiate");
+
+        assert!(
+            result["answer_sdp"]
+                .as_str()
+                .expect("answer sdp present")
+                .contains("m=audio")
+        );
+        assert_eq!(result["revision"], json!(revision));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdp_offer_renegotiates_after_publish_and_subscribe() {
+        let rooms = manager();
+        let room = RoomId("meeting-renegotiate-subscribe".to_string());
+        let alice_revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        let mut bob_state = SessionState {
+            rooms: rooms.clone(),
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+            }),
+        };
+
+        sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": bob_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("initial bob negotiation should succeed");
+
+        let publish_revision = rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+        assert!(publish_revision > alice_revision);
+
+        let subscribe_result = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio", "alice-video"]
+            }),
+        )
+        .await
+        .expect("bob subscribes");
+        let subscribe_revision = subscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert!(subscribe_revision > publish_revision);
+
+        let renegotiated = sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("renegotiation after subscribe should succeed");
+
+        assert_eq!(renegotiated["revision"], json!(subscribe_revision));
+        assert!(
+            renegotiated["answer_sdp"]
+                .as_str()
+                .expect("answer sdp present")
+                .contains("m=video")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdp_offer_renegotiates_after_unsubscribe() {
+        let rooms = manager();
+        let room = RoomId("meeting-renegotiate-unsubscribe".to_string());
+        rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+
+        let mut bob_state = SessionState {
+            rooms,
+            joined: Some(JoinedParticipant {
+                room,
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+            }),
+        };
+
+        let subscribe_result = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio", "alice-video"]
+            }),
+        )
+        .await
+        .expect("bob subscribes");
+        let subscribe_revision = subscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+
+        sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("negotiation after subscribe should succeed");
+
+        let unsubscribe_result = unsubscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-video"]
+            }),
+        )
+        .await
+        .expect("bob unsubscribes");
+        let unsubscribe_revision = unsubscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert!(unsubscribe_revision > subscribe_revision);
+
+        let renegotiated = sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": unsubscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("renegotiation after unsubscribe should succeed");
+
+        assert_eq!(renegotiated["revision"], json!(unsubscribe_revision));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdp_offer_renegotiates_after_publisher_rejoin_and_resubscribe() {
+        let rooms = manager();
+        let room = RoomId("meeting-renegotiate-rejoin".to_string());
+        rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-audio-v1".to_string(),
+                    media_kind: MediaKind::Audio,
+                    mid: Some("0".to_string()),
+                }],
+            )
+            .expect("alice publishes");
+
+        let mut bob_state = SessionState {
+            rooms: rooms.clone(),
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+            }),
+        };
+
+        let first_subscribe = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio-v1"]
+            }),
+        )
+        .await
+        .expect("bob subscribes to first track");
+        let first_subscribe_revision = first_subscribe["revision"]
+            .as_u64()
+            .expect("revision present");
+
+        sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": first_subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("initial negotiation should succeed");
+
+        rooms
+            .meeting_leave(room.clone(), "alice")
+            .await
+            .expect("alice leaves");
+        let rejoin_revision = rooms
+            .meeting_join(
+                room.clone(),
+                "alice".to_string(),
+                Some("Alice Return".to_string()),
+            )
+            .expect("alice rejoins");
+        let republish_revision = rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-audio-v2".to_string(),
+                    media_kind: MediaKind::Audio,
+                    mid: Some("0".to_string()),
+                }],
+            )
+            .expect("alice republishes");
+        assert!(republish_revision > rejoin_revision);
+
+        let second_subscribe = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio-v2"]
+            }),
+        )
+        .await
+        .expect("bob resubscribes to second track");
+        let second_subscribe_revision = second_subscribe["revision"]
+            .as_u64()
+            .expect("revision present");
+
+        let renegotiated = sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": second_subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("renegotiation after publisher rejoin should succeed");
+
+        assert_eq!(renegotiated["revision"], json!(second_subscribe_revision));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_and_unsubscribe_update_revision_and_visible_subscriptions() {
+        let rooms = manager();
+        let room = RoomId("meeting-subscriptions".to_string());
+        let alice_revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+        assert!(bob_revision >= alice_revision);
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+            }),
+        };
+
+        let subscribe_result = subscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-audio", "alice-video"]
+            }),
+        )
+        .await
+        .expect("subscribe should succeed");
+        let subscribe_revision = subscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert_eq!(subscribe_result["needs_renegotiation"], json!(false));
+
+        let subscriptions_after_subscribe = list_subscriptions(&mut state)
+            .await
+            .expect("subscriptions should be listable after subscribe");
+        assert_eq!(
+            subscriptions_after_subscribe["requested_track_ids"],
+            json!(["alice-audio", "alice-video"])
+        );
+        assert_eq!(
+            subscriptions_after_subscribe["effective_track_ids"],
+            json!(["alice-audio", "alice-video"])
+        );
+
+        let unsubscribe_result = unsubscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-video"]
+            }),
+        )
+        .await
+        .expect("unsubscribe should succeed");
+        let unsubscribe_revision = unsubscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert!(unsubscribe_revision > subscribe_revision);
+        assert_eq!(unsubscribe_result["needs_renegotiation"], json!(false));
+
+        let subscriptions_after_unsubscribe = list_subscriptions(&mut state)
+            .await
+            .expect("subscriptions should be listable after unsubscribe");
+        assert_eq!(
+            subscriptions_after_unsubscribe["requested_track_ids"],
+            json!(["alice-audio"])
+        );
+        assert_eq!(
+            subscriptions_after_unsubscribe["effective_track_ids"],
+            json!(["alice-audio"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_close_cleanup_removes_participant_and_allows_reconnect() {
+        let rooms = manager();
+        let room = RoomId("meeting-reconnect".to_string());
+
+        let first_join = join(
+            &mut SessionState {
+                rooms: rooms.clone(),
+                joined: None,
+            },
+            json!({
+                "room": room.0,
+                "display_name": "Alice"
+            }),
+        )
+        .await
+        .expect("first join should succeed");
+
+        let first_participant_id = first_join["participant_id"]
+            .as_str()
+            .expect("participant id present")
+            .to_string();
+        let first_revision = first_join["revision"].as_u64().expect("revision present");
+
+        let mut first_state = SessionState {
+            rooms: rooms.clone(),
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: first_participant_id.clone(),
+                revision: first_revision,
+            }),
+        };
+
+        let before_cleanup = list_participants(&mut first_state)
+            .await
+            .expect("participants should be listable before cleanup");
+        assert_eq!(
+            before_cleanup["participants"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        cleanup_joined_session(&mut first_state).await;
+        assert!(first_state.joined.is_none());
+
+        let mut second_state = SessionState {
+            rooms,
+            joined: None,
+        };
+        let second_join = join(
+            &mut second_state,
+            json!({
+                "room": room.0,
+                "display_name": "Alice Reconnected"
+            }),
+        )
+        .await
+        .expect("reconnect join should succeed");
+        let second_participant_id = second_join["participant_id"]
+            .as_str()
+            .expect("participant id present");
+        assert_ne!(second_participant_id, first_participant_id);
+
+        let after_reconnect = list_participants(&mut second_state)
+            .await
+            .expect("participants should be listable after reconnect");
+        let participants = after_reconnect["participants"]
+            .as_array()
+            .expect("participants array");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0]["display_name"], json!("Alice Reconnected"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publisher_leave_prunes_other_participant_subscriptions() {
+        let rooms = manager();
+        let room = RoomId("meeting-publisher-leave".to_string());
+        let alice_revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+        assert!(bob_revision >= alice_revision);
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+
+        let mut bob_state = SessionState {
+            rooms: rooms.clone(),
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+            }),
+        };
+
+        subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio", "alice-video"]
+            }),
+        )
+        .await
+        .expect("bob subscribes");
+
+        let before_leave = list_subscriptions(&mut bob_state)
+            .await
+            .expect("subscriptions should be visible before leave");
+        assert_eq!(
+            before_leave["requested_track_ids"],
+            json!(["alice-audio", "alice-video"])
+        );
+
+        rooms
+            .meeting_leave(room.clone(), "alice")
+            .await
+            .expect("alice leaves");
+
+        let after_leave = list_subscriptions(&mut bob_state)
+            .await
+            .expect("subscriptions should still be queryable after publisher leave");
+        assert_eq!(after_leave["requested_track_ids"], json!([]));
+        assert_eq!(after_leave["effective_track_ids"], json!([]));
+
+        let publications = super::list_publications(&mut bob_state)
+            .await
+            .expect("publications should be listable after publisher leave");
+        assert_eq!(publications["publications"], json!([]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publisher_rejoin_can_republish_and_be_resubscribed() {
+        let rooms = manager();
+        let room = RoomId("meeting-publisher-rejoin".to_string());
+        let _alice_revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-audio-v1".to_string(),
+                    media_kind: MediaKind::Audio,
+                    mid: Some("0".to_string()),
+                }],
+            )
+            .expect("alice publishes first track");
+
+        let mut bob_state = SessionState {
+            rooms: rooms.clone(),
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+            }),
+        };
+
+        let first_subscribe = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio-v1"]
+            }),
+        )
+        .await
+        .expect("bob subscribes to first publication");
+        let first_subscribe_revision = first_subscribe["revision"]
+            .as_u64()
+            .expect("revision present");
+
+        rooms
+            .meeting_leave(room.clone(), "alice")
+            .await
+            .expect("alice leaves");
+
+        let rejoin_revision = rooms
+            .meeting_join(
+                room.clone(),
+                "alice".to_string(),
+                Some("Alice Return".to_string()),
+            )
+            .expect("alice rejoins");
+        assert!(rejoin_revision > first_subscribe_revision);
+
+        let republish_revision = rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-audio-v2".to_string(),
+                    media_kind: MediaKind::Audio,
+                    mid: Some("0".to_string()),
+                }],
+            )
+            .expect("alice republishes");
+        assert!(republish_revision > rejoin_revision);
+
+        let second_subscribe = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio-v2"]
+            }),
+        )
+        .await
+        .expect("bob resubscribes to new publication");
+        let second_subscribe_revision = second_subscribe["revision"]
+            .as_u64()
+            .expect("revision present");
+        assert!(second_subscribe_revision > republish_revision);
+        assert_eq!(second_subscribe["needs_renegotiation"], json!(false));
+
+        let subscriptions = list_subscriptions(&mut bob_state)
+            .await
+            .expect("subscriptions should be listable after republish");
+        assert_eq!(
+            subscriptions["requested_track_ids"],
+            json!(["alice-audio-v2"])
+        );
+        assert_eq!(
+            subscriptions["effective_track_ids"],
+            json!(["alice-audio-v2"])
+        );
     }
 }

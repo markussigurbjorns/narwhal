@@ -308,13 +308,102 @@ mod tests {
         http::{Request, StatusCode, header},
         response::IntoResponse,
     };
+    use futures_util::{SinkExt, StreamExt};
     use media::GstRuntime;
     use narwhal_core::{MediaKind, MeetingPublishTrack, RoomId, RoomManager, RoomMode};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
     use tower::util::ServiceExt;
 
     fn manager() -> RoomManager {
         let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
         RoomManager::new(gst)
+    }
+
+    fn browser_like_offer_sdp() -> String {
+        "\
+v=0\r\n\
+o=- 4611733055804614137 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:1234 cname:test\r\n\
+a=ssrc:1234 msid:test audio0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=ssrc:5678 cname:test\r\n\
+a=ssrc:5678 msid:test video0\r\n"
+            .to_string()
+    }
+
+    async fn spawn_ws_app(
+        rooms: RoomManager,
+    ) -> std::io::Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app(rooms))
+                .await
+                .map_err(std::io::Error::other)
+        });
+        Ok((format!("ws://{addr}/ws"), handle))
+    }
+
+    async fn ws_connect(url: &str) -> WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+        let (stream, _) = connect_async(url).await.expect("ws connect succeeds");
+        stream
+    }
+
+    async fn ws_rpc(
+        ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        ws.send(Message::Text(request.to_string().into()))
+            .await
+            .expect("ws send succeeds");
+
+        let message = ws.next().await.expect("response frame").expect("ws frame");
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        let response: Value = serde_json::from_str(&text).expect("json response");
+        if let Some(error) = response.get("error") {
+            panic!("rpc {method} failed: {error}");
+        }
+        response["result"].clone()
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -569,5 +658,255 @@ mod tests {
         assert!(body.contains(
             "narwhal_negotiation_total{cause=\"no_publisher\",flow=\"broadcast_whep_subscribe\",outcome=\"failure\"} 1"
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_route_supports_renegotiation_across_publish_and_rejoin() {
+        let rooms = manager();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+        let mut bob = ws_connect(&ws_url).await;
+
+        let alice_join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-integration",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let alice_participant_id = alice_join["participant_id"]
+            .as_str()
+            .expect("alice participant id")
+            .to_string();
+
+        let bob_join = ws_rpc(
+            &mut bob,
+            2,
+            "join",
+            json!({
+                "room": "ws-integration",
+                "display_name": "Bob"
+            }),
+        )
+        .await;
+        let bob_initial_revision = bob_join["revision"].as_u64().expect("bob revision");
+
+        let bob_initial_offer = ws_rpc(
+            &mut bob,
+            3,
+            "sdp_offer",
+            json!({
+                "revision": bob_initial_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+        assert!(
+            bob_initial_offer["answer_sdp"]
+                .as_str()
+                .expect("answer sdp")
+                .contains("m=audio")
+        );
+        let bob_initial_trickle = ws_rpc(
+            &mut bob,
+            31,
+            "trickle_ice",
+            json!({
+                "mline_index": 0,
+                "candidate": "candidate:1 1 udp 2122260223 192.0.2.10 54400 typ host"
+            }),
+        )
+        .await;
+        assert_eq!(bob_initial_trickle["ok"], json!(true));
+        let bob_initial_drain = ws_rpc(
+            &mut bob,
+            32,
+            "drain_ice",
+            json!({
+                "max": 8
+            }),
+        )
+        .await;
+        assert!(bob_initial_drain["candidates"].is_array());
+
+        let _alice_publish = ws_rpc(
+            &mut alice,
+            4,
+            "publish_tracks",
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-audio-v1",
+                        "media_kind": "audio",
+                        "mid": "0"
+                    },
+                    {
+                        "track_id": "alice-video-v1",
+                        "media_kind": "video",
+                        "mid": "1"
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let bob_subscribe = ws_rpc(
+            &mut bob,
+            5,
+            "subscribe",
+            json!({
+                "track_ids": ["alice-audio-v1", "alice-video-v1"]
+            }),
+        )
+        .await;
+        let bob_subscribe_revision = bob_subscribe["revision"]
+            .as_u64()
+            .expect("subscribe revision");
+        assert_eq!(bob_subscribe["needs_renegotiation"], json!(false));
+
+        let bob_renegotiated = ws_rpc(
+            &mut bob,
+            6,
+            "sdp_offer",
+            json!({
+                "revision": bob_subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+        assert_eq!(bob_renegotiated["revision"], json!(bob_subscribe_revision));
+        let bob_post_subscribe_trickle = ws_rpc(
+            &mut bob,
+            33,
+            "trickle_ice",
+            json!({
+                "mline_index": 1,
+                "candidate": "candidate:2 1 udp 2122260223 192.0.2.11 54402 typ host"
+            }),
+        )
+        .await;
+        assert_eq!(bob_post_subscribe_trickle["ok"], json!(true));
+        let bob_post_subscribe_drain = ws_rpc(
+            &mut bob,
+            34,
+            "drain_ice",
+            json!({
+                "max": 8
+            }),
+        )
+        .await;
+        assert!(bob_post_subscribe_drain["candidates"].is_array());
+
+        let _alice_left = ws_rpc(&mut alice, 7, "leave", json!({})).await;
+        alice.close(None).await.expect("alice close succeeds");
+
+        let bob_after_leave = ws_rpc(&mut bob, 8, "list_subscriptions", json!({})).await;
+        assert_eq!(bob_after_leave["requested_track_ids"], json!([]));
+        assert_eq!(bob_after_leave["effective_track_ids"], json!([]));
+
+        let mut alice_rejoined = ws_connect(&ws_url).await;
+        let alice_rejoin = ws_rpc(
+            &mut alice_rejoined,
+            9,
+            "join",
+            json!({
+                "room": "ws-integration",
+                "display_name": "Alice Return"
+            }),
+        )
+        .await;
+        assert_ne!(
+            alice_rejoin["participant_id"]
+                .as_str()
+                .expect("new participant id"),
+            alice_participant_id
+        );
+
+        let _alice_republish = ws_rpc(
+            &mut alice_rejoined,
+            10,
+            "publish_tracks",
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-audio-v2",
+                        "media_kind": "audio",
+                        "mid": "0"
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let bob_resubscribe = ws_rpc(
+            &mut bob,
+            11,
+            "subscribe",
+            json!({
+                "track_ids": ["alice-audio-v2"]
+            }),
+        )
+        .await;
+        let bob_resubscribe_revision = bob_resubscribe["revision"]
+            .as_u64()
+            .expect("resubscribe revision");
+
+        let bob_reoffer = ws_rpc(
+            &mut bob,
+            12,
+            "sdp_offer",
+            json!({
+                "revision": bob_resubscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+        assert_eq!(bob_reoffer["revision"], json!(bob_resubscribe_revision));
+        let bob_post_rejoin_trickle = ws_rpc(
+            &mut bob,
+            35,
+            "trickle_ice",
+            json!({
+                "mline_index": 0,
+                "candidate": "candidate:3 1 udp 2122260223 192.0.2.12 54404 typ host"
+            }),
+        )
+        .await;
+        assert_eq!(bob_post_rejoin_trickle["ok"], json!(true));
+        let bob_post_rejoin_drain = ws_rpc(
+            &mut bob,
+            36,
+            "drain_ice",
+            json!({
+                "max": 8
+            }),
+        )
+        .await;
+        assert!(bob_post_rejoin_drain["candidates"].is_array());
+
+        let bob_final_subscriptions = ws_rpc(&mut bob, 13, "list_subscriptions", json!({})).await;
+        assert_eq!(
+            bob_final_subscriptions["requested_track_ids"],
+            json!(["alice-audio-v2"])
+        );
+        assert_eq!(
+            bob_final_subscriptions["effective_track_ids"],
+            json!(["alice-audio-v2"])
+        );
+
+        bob.close(None).await.expect("bob close succeeds");
+        alice_rejoined
+            .close(None)
+            .await
+            .expect("alice rejoined close succeeds");
+        server_handle.abort();
     }
 }

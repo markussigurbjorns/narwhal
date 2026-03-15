@@ -15,6 +15,8 @@ uuid = { version = "1.21.0", features = ["v4"] }
 narwhal-core = { path = "../narwhal-core" }
 
 [dev-dependencies]
+futures-util = "0.3.31"
 media = { path = "../media" }
 tokio = { version = "1.49.0", features = ["macros", "rt"] }
+tokio-tungstenite = "0.28.0"
 tower = { version = "0.5.2", features = ["util"] }
