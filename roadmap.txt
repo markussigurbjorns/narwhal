@@ -149,7 +149,7 @@
   - make server-driven renegotiation explicit
   - finish ICE restart handling
   - validate MID/RID/SSRC routing under simulcast
-  ~ ensure subscription changes become effective without desync
+  ✓ ensure subscription changes become effective without desync
   ~ handle publisher restart while subscribers remain connected
   ~ handle joining mid-stream and keyframe warmup robustly
 
@@ -167,7 +167,7 @@
 
   ✓ integration tests, not just unit tests
   - meeting negotiation state diagram
-  - zero known desync cases in happy-path browsers
+  ~ zero known desync cases in happy-path browsers
 
   Exit criteria:
 

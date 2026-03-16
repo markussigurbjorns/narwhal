@@ -468,7 +468,8 @@ Success result:
 Current behavior:
 
 - publishing increments room revision
-- the API currently still reports `needs_renegotiation: false`
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
+- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for publish changes
 
 #### `unpublish_tracks`
 
@@ -513,7 +514,8 @@ Notes:
 - requested tracks are validated against currently known publications
 - subscription policy may reduce the effective set relative to the requested set
 - subscribing increments room revision
-- the API currently still reports `needs_renegotiation: false`
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
+- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for subscribe changes
 
 #### `unsubscribe`
 
@@ -537,7 +539,8 @@ Success result:
 Current behavior:
 
 - unsubscribing increments room revision
-- the API currently still reports `needs_renegotiation: false`
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
+- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for unsubscribe changes
 
 #### `list_participants`
 
@@ -637,6 +640,11 @@ Success result:
 }
 ```
 
+Current behavior:
+
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
+- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for policy changes
+
 ## Revision Semantics
 
 Meeting rooms maintain a monotonically increasing room revision.
@@ -651,9 +659,9 @@ Current behavior:
 
 Current limitation:
 
-- the API already returns `revision`, but renegotiation is still not fully modeled
-- many successful mutation responses currently return `"needs_renegotiation": false`
-- clients should treat revision as authoritative room state versioning, but not as a finished renegotiation protocol
+- the API already returns `revision`, and `needs_renegotiation` is now session-aware, but renegotiation is still not fully modeled server-wide
+- `needs_renegotiation` currently reflects whether the caller's own session has already negotiated and then mutated state
+- clients should treat revision as authoritative room state versioning, but not as a finished renegotiation protocol for every participant in the room
 
 ## Current Limitations
 

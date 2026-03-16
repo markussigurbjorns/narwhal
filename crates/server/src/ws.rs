@@ -30,6 +30,7 @@ struct JoinedParticipant {
     room: RoomId,
     participant_id: String,
     revision: u64,
+    negotiated: bool,
 }
 
 #[derive(Deserialize)]
@@ -289,6 +290,7 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
         room: room.clone(),
         participant_id: participant_id.clone(),
         revision,
+        negotiated: false,
     });
 
     info!(
@@ -335,18 +337,41 @@ async fn sdp_offer(state: &mut SessionState, params: Value) -> Result<Value, Rpc
     let params: SdpOfferParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for sdp_offer: {err}")))?;
 
+    let requested_revision = params.revision;
+    let offer_sdp = params.offer_sdp;
+
+    tracing::debug!(
+        participant_id = %joined.participant_id,
+        room = %joined.room.0,
+        requested_revision,
+        negotiated = joined.negotiated,
+        offer_sdp = %offer_sdp,
+        "meeting sdp_offer received"
+    );
+
     let answer = state
         .rooms
         .meeting_sdp_offer(
             joined.room.clone(),
             &joined.participant_id,
-            params.revision,
-            params.offer_sdp,
+            requested_revision,
+            offer_sdp,
         )
         .await
         .map_err(rpc_transport_error)?;
 
+    tracing::debug!(
+        participant_id = %joined.participant_id,
+        room = %joined.room.0,
+        requested_revision,
+        negotiated = joined.negotiated,
+        answer_revision = answer.revision,
+        answer_sdp = %answer.answer_sdp,
+        "meeting sdp_offer answered"
+    );
+
     joined.revision = answer.revision;
+    joined.negotiated = true;
 
     Ok(json!({
         "answer_sdp": answer.answer_sdp,
@@ -419,10 +444,11 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
         .meeting_publish_tracks(joined.room.clone(), &joined.participant_id, tracks)
         .map_err(rpc_transport_error)?;
     joined.revision = revision;
+    let needs_renegotiation = joined.negotiated;
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": false
+        "needs_renegotiation": needs_renegotiation
     }))
 }
 
@@ -447,10 +473,11 @@ async fn unpublish_tracks(state: &mut SessionState, params: Value) -> Result<Val
         )
         .map_err(rpc_transport_error)?;
     joined.revision = revision;
+    let needs_renegotiation = joined.negotiated;
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": false
+        "needs_renegotiation": needs_renegotiation
     }))
 }
 
@@ -471,10 +498,11 @@ async fn subscribe(state: &mut SessionState, params: Value) -> Result<Value, Rpc
         )
         .map_err(rpc_transport_error)?;
     joined.revision = revision;
+    let needs_renegotiation = joined.negotiated;
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": false
+        "needs_renegotiation": needs_renegotiation
     }))
 }
 
@@ -495,10 +523,11 @@ async fn unsubscribe(state: &mut SessionState, params: Value) -> Result<Value, R
         )
         .map_err(rpc_transport_error)?;
     joined.revision = revision;
+    let needs_renegotiation = joined.negotiated;
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": false
+        "needs_renegotiation": needs_renegotiation
     }))
 }
 
@@ -640,11 +669,12 @@ async fn set_policy_mode(state: &mut SessionState, params: Value) -> Result<Valu
         .meeting_set_policy_mode(joined.room.clone(), mode)
         .map_err(rpc_transport_error)?;
     joined.revision = revision;
+    let needs_renegotiation = joined.negotiated;
 
     Ok(json!({
         "mode": policy_mode_label(mode),
         "revision": revision,
-        "needs_renegotiation": false
+        "needs_renegotiation": needs_renegotiation
     }))
 }
 
@@ -734,6 +764,11 @@ a=ssrc:5678 msid:test video0\r\n"
             .to_string()
     }
 
+    fn extract_transport_attr(sdp: &str, prefix: &str) -> Option<String> {
+        sdp.lines()
+            .find_map(|line| line.strip_prefix(prefix).map(|rest| rest.trim().to_string()))
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn join_rejects_when_session_already_joined() {
         let mut state = SessionState {
@@ -742,6 +777,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: RoomId("room-a".to_string()),
                 participant_id: "participant-a".to_string(),
                 revision: 1,
+                negotiated: false,
             }),
         };
 
@@ -813,6 +849,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: "alice".to_string(),
                 revision: alice_revision,
+                negotiated: false,
             }),
         };
 
@@ -844,6 +881,7 @@ a=ssrc:5678 msid:test video0\r\n"
             room,
             participant_id: "bob".to_string(),
             revision: bob_revision,
+            negotiated: false,
         });
 
         let subscribe_result = subscribe(
@@ -879,6 +917,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room,
                 participant_id: "alice".to_string(),
                 revision,
+                negotiated: false,
             }),
         };
 
@@ -910,6 +949,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room,
                 participant_id: "alice".to_string(),
                 revision,
+                negotiated: false,
             }),
         };
 
@@ -949,6 +989,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: "bob".to_string(),
                 revision: bob_revision,
+                negotiated: false,
             }),
         };
 
@@ -994,6 +1035,7 @@ a=ssrc:5678 msid:test video0\r\n"
             .as_u64()
             .expect("revision present");
         assert!(subscribe_revision > publish_revision);
+        assert_eq!(subscribe_result["needs_renegotiation"], json!(true));
 
         let renegotiated = sdp_offer(
             &mut bob_state,
@@ -1011,6 +1053,104 @@ a=ssrc:5678 msid:test video0\r\n"
                 .as_str()
                 .expect("answer sdp present")
                 .contains("m=video")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn renegotiation_preserves_transport_identity_after_subscribe() {
+        let rooms = manager();
+        let room = RoomId("meeting-renegotiate-transport-stable".to_string());
+        rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        let mut bob_state = SessionState {
+            rooms: rooms.clone(),
+            joined: Some(JoinedParticipant {
+                room: room.clone(),
+                participant_id: "bob".to_string(),
+                revision: bob_revision,
+                negotiated: false,
+            }),
+        };
+
+        let initial = sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": bob_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("initial bob negotiation should succeed");
+        let initial_answer = initial["answer_sdp"]
+            .as_str()
+            .expect("initial answer sdp");
+        let initial_ice_ufrag = extract_transport_attr(initial_answer, "a=ice-ufrag:")
+            .expect("initial answer ice ufrag");
+        let initial_ice_pwd =
+            extract_transport_attr(initial_answer, "a=ice-pwd:").expect("initial answer ice pwd");
+        let initial_fingerprint = extract_transport_attr(initial_answer, "a=fingerprint:")
+            .expect("initial answer fingerprint");
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+
+        let subscribe_result = subscribe(
+            &mut bob_state,
+            json!({
+                "track_ids": ["alice-audio", "alice-video"]
+            }),
+        )
+        .await
+        .expect("bob subscribes");
+        let subscribe_revision = subscribe_result["revision"]
+            .as_u64()
+            .expect("revision present");
+
+        let renegotiated = sdp_offer(
+            &mut bob_state,
+            json!({
+                "revision": subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("renegotiation after subscribe should succeed");
+        let renegotiated_answer = renegotiated["answer_sdp"]
+            .as_str()
+            .expect("renegotiated answer sdp");
+
+        assert_eq!(
+            extract_transport_attr(renegotiated_answer, "a=ice-ufrag:").as_deref(),
+            Some(initial_ice_ufrag.as_str())
+        );
+        assert_eq!(
+            extract_transport_attr(renegotiated_answer, "a=ice-pwd:").as_deref(),
+            Some(initial_ice_pwd.as_str())
+        );
+        assert_eq!(
+            extract_transport_attr(renegotiated_answer, "a=fingerprint:").as_deref(),
+            Some(initial_fingerprint.as_str())
         );
     }
 
@@ -1050,6 +1190,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room,
                 participant_id: "bob".to_string(),
                 revision: bob_revision,
+                negotiated: false,
             }),
         };
 
@@ -1087,6 +1228,7 @@ a=ssrc:5678 msid:test video0\r\n"
             .as_u64()
             .expect("revision present");
         assert!(unsubscribe_revision > subscribe_revision);
+        assert_eq!(unsubscribe_result["needs_renegotiation"], json!(true));
 
         let renegotiated = sdp_offer(
             &mut bob_state,
@@ -1130,6 +1272,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: "bob".to_string(),
                 revision: bob_revision,
+                negotiated: false,
             }),
         };
 
@@ -1240,6 +1383,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: "bob".to_string(),
                 revision: bob_revision,
+                negotiated: false,
             }),
         };
 
@@ -1325,6 +1469,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: first_participant_id.clone(),
                 revision: first_revision,
+                negotiated: false,
             }),
         };
 
@@ -1404,6 +1549,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: "bob".to_string(),
                 revision: bob_revision,
+                negotiated: false,
             }),
         };
 
@@ -1470,6 +1616,7 @@ a=ssrc:5678 msid:test video0\r\n"
                 room: room.clone(),
                 participant_id: "bob".to_string(),
                 revision: bob_revision,
+                negotiated: false,
             }),
         };
 
@@ -1537,5 +1684,51 @@ a=ssrc:5678 msid:test video0\r\n"
             subscriptions["effective_track_ids"],
             json!(["alice-audio-v2"])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_requires_renegotiation_after_successful_sdp_offer() {
+        let rooms = manager();
+        let room = RoomId("meeting-publish-needs-renegotiation".to_string());
+        let revision = rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(JoinedParticipant {
+                room,
+                participant_id: "alice".to_string(),
+                revision,
+                negotiated: false,
+            }),
+        };
+
+        sdp_offer(
+            &mut state,
+            json!({
+                "revision": revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("initial negotiation should succeed");
+
+        let publish_result = publish_tracks(
+            &mut state,
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-audio",
+                        "media_kind": "audio",
+                        "mid": "0"
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("publish should succeed");
+
+        assert_eq!(publish_result["needs_renegotiation"], json!(true));
     }
 }

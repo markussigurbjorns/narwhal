@@ -23,7 +23,7 @@ use gstreamer::{
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use parking_lot::RwLock;
-use std::{env, sync::Arc};
+use std::{collections::HashSet, env, sync::Arc};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::GstRuntime;
@@ -520,7 +520,14 @@ impl PeerSession {
                             Ok(txt) => {
                                 let txt = if matches!(role_for_answer, PeerRole::MeetingParticipant)
                                 {
-                                    normalize_answer_setup_attr(txt)
+                                    let previous_local_sdp =
+                                        local_sdp_store_for_answer.read().clone();
+                                    tracing::debug!(
+                                        peer_id = %peer_id_for_answer,
+                                        raw_answer_sdp = %txt,
+                                        "raw meeting answer SDP from webrtcbin"
+                                    );
+                                    normalize_meeting_answer_sdp(txt, previous_local_sdp.as_deref())
                                 } else {
                                     txt
                                 };
@@ -709,10 +716,15 @@ impl PeerSession {
     }
 }
 
-fn normalize_answer_setup_attr(sdp: String) -> String {
+fn normalize_meeting_answer_sdp(sdp: String, previous_local_sdp: Option<&str>) -> String {
     // In renegotiation some stacks may emit actpass (or duplicate setup lines)
     // in generated answer SDP. Browsers require answer setup to be active/passive
     // and tolerate only one setup line per media section.
+    //
+    // We also strip answer-side RID/simulcast send attributes. Meeting participants
+    // may offer simulcast, and we still parse those offer RIDs for ingress routing,
+    // but echoing send-side RID/simulcast lines back in the answer has caused
+    // browser SDP parse failures during renegotiation.
     let normalized = sdp
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -720,44 +732,428 @@ fn normalize_answer_setup_attr(sdp: String) -> String {
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
 
+    let preserved_sections = previous_local_sdp
+        .map(parse_preserved_transport_attrs)
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(normalized.len());
-    let mut in_media = false;
-    let mut saw_setup_in_media = false;
+    let mut current_media: Option<MediaSectionNormalizer> = None;
+    let mut media_index = 0usize;
 
-    for mut line in normalized {
+    for line in normalized {
         if line.is_empty() {
             continue;
         }
 
         if line.starts_with("m=") {
-            in_media = true;
-            saw_setup_in_media = false;
-            out.push(line);
-            continue;
-        }
-
-        if line.starts_with("a=setup:") {
-            if in_media {
-                if saw_setup_in_media {
-                    continue;
-                }
-                if line == "a=setup:actpass" || line == "a=setup:holdconn" {
-                    line = "a=setup:active".to_string();
-                }
-                saw_setup_in_media = true;
-            } else if line == "a=setup:actpass" || line == "a=setup:holdconn" {
-                line = "a=setup:active".to_string();
+            if let Some(section) = current_media.take() {
+                out.extend(section.finish());
             }
-            out.push(line);
+            let preserved = preserved_sections.get(media_index).cloned();
+            current_media = Some(MediaSectionNormalizer::new(line, preserved));
+            media_index += 1;
             continue;
         }
 
-        out.push(line);
+        if let Some(section) = current_media.as_mut() {
+            section.push_line(line);
+        } else {
+            out.push(normalize_session_level_line(line));
+        }
+    }
+
+    if let Some(section) = current_media {
+        out.extend(section.finish());
     }
 
     let mut joined = out.join("\r\n");
     joined.push_str("\r\n");
     joined
+}
+
+fn normalize_session_level_line(mut line: String) -> String {
+    if line == "a=setup:actpass" || line == "a=setup:holdconn" {
+        line = "a=setup:active".to_string();
+    }
+    line
+}
+
+#[derive(Clone, Default)]
+struct PreservedTransportAttrs {
+    ice_ufrag: Option<String>,
+    ice_pwd: Option<String>,
+    fingerprint: Option<String>,
+}
+
+fn parse_preserved_transport_attrs(sdp: &str) -> Vec<PreservedTransportAttrs> {
+    let mut out = Vec::new();
+    let mut current: Option<PreservedTransportAttrs> = None;
+
+    for raw_line in sdp.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("m=") {
+            if let Some(section) = current.take() {
+                out.push(section);
+            }
+            current = Some(PreservedTransportAttrs::default());
+            continue;
+        }
+
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+
+        if line.starts_with("a=ice-ufrag:") && section.ice_ufrag.is_none() {
+            section.ice_ufrag = Some(line.to_string());
+        } else if line.starts_with("a=ice-pwd:") && section.ice_pwd.is_none() {
+            section.ice_pwd = Some(line.to_string());
+        } else if line.starts_with("a=fingerprint:") && section.fingerprint.is_none() {
+            section.fingerprint = Some(line.to_string());
+        }
+    }
+
+    if let Some(section) = current {
+        out.push(section);
+    }
+
+    out
+}
+
+struct MediaSectionNormalizer {
+    lines: Vec<String>,
+    payload_types: HashSet<String>,
+    preserved: Option<PreservedTransportAttrs>,
+    seen_setup: bool,
+    seen_ice_ufrag: bool,
+    seen_ice_pwd: bool,
+    seen_fingerprint: bool,
+    seen_rtcp_mux: bool,
+    seen_rtcp_rsize: bool,
+    seen_mid: bool,
+    seen_rtcp: bool,
+}
+
+impl MediaSectionNormalizer {
+    fn new(mline: String, preserved: Option<PreservedTransportAttrs>) -> Self {
+        let payload_types = mline
+            .split_whitespace()
+            .skip(3)
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+
+        Self {
+            lines: vec![mline],
+            payload_types,
+            preserved,
+            seen_setup: false,
+            seen_ice_ufrag: false,
+            seen_ice_pwd: false,
+            seen_fingerprint: false,
+            seen_rtcp_mux: false,
+            seen_rtcp_rsize: false,
+            seen_mid: false,
+            seen_rtcp: false,
+        }
+    }
+
+    fn push_line(&mut self, mut line: String) {
+        if line.starts_with("a=setup:") {
+            if self.seen_setup {
+                return;
+            }
+            if line == "a=setup:actpass" || line == "a=setup:holdconn" {
+                line = "a=setup:active".to_string();
+            }
+            self.seen_setup = true;
+            self.lines.push(line);
+            return;
+        }
+
+        if line.starts_with("a=ice-ufrag:") {
+            if self.seen_ice_ufrag {
+                return;
+            }
+            self.seen_ice_ufrag = true;
+            self.lines
+                .push(self.preserved_line_or_current(|attrs| attrs.ice_ufrag.clone(), line));
+            return;
+        }
+
+        if line.starts_with("a=ice-pwd:") {
+            if self.seen_ice_pwd {
+                return;
+            }
+            self.seen_ice_pwd = true;
+            self.lines
+                .push(self.preserved_line_or_current(|attrs| attrs.ice_pwd.clone(), line));
+            return;
+        }
+
+        if line.starts_with("a=fingerprint:") {
+            if self.seen_fingerprint {
+                return;
+            }
+            self.seen_fingerprint = true;
+            self.lines.push(
+                self.preserved_line_or_current(|attrs| attrs.fingerprint.clone(), line),
+            );
+            return;
+        }
+
+        if line == "a=rtcp-mux" {
+            if self.seen_rtcp_mux {
+                return;
+            }
+            self.seen_rtcp_mux = true;
+            self.lines.push(line);
+            return;
+        }
+
+        if line == "a=rtcp-rsize" {
+            if self.seen_rtcp_rsize {
+                return;
+            }
+            self.seen_rtcp_rsize = true;
+            self.lines.push(line);
+            return;
+        }
+
+        if line.starts_with("a=mid:") {
+            if self.seen_mid {
+                return;
+            }
+            self.seen_mid = true;
+            self.lines.push(line);
+            return;
+        }
+
+        if line.starts_with("a=rtcp:") {
+            if self.seen_rtcp {
+                return;
+            }
+            self.seen_rtcp = true;
+            self.lines.push(line);
+            return;
+        }
+
+        if line.starts_with("a=rid:") {
+            let mut parts = line["a=rid:".len()..].split_whitespace();
+            let _rid = parts.next();
+            let direction = parts.next();
+            if matches!(direction, Some("send")) {
+                return;
+            }
+        }
+
+        if let Some(rest) = line.strip_prefix("a=simulcast:") {
+            let send_only = rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|token| token == "send");
+            if send_only || rest.starts_with("send ") {
+                return;
+            }
+        }
+
+        if !self.line_matches_payloads(&line) {
+            return;
+        }
+
+        self.lines.push(line);
+    }
+
+    fn line_matches_payloads(&self, line: &str) -> bool {
+        if let Some(rest) = line.strip_prefix("a=rtcp-fb:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|pt| self.payload_types.contains(pt) || pt == "*");
+        }
+        if let Some(rest) = line.strip_prefix("a=fmtp:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|pt| self.payload_types.contains(pt));
+        }
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|pt| self.payload_types.contains(pt));
+        }
+        true
+    }
+
+    fn preserved_line_or_current(
+        &self,
+        select: impl Fn(&PreservedTransportAttrs) -> Option<String>,
+        current: String,
+    ) -> String {
+        self.preserved
+            .as_ref()
+            .and_then(select)
+            .unwrap_or(current)
+    }
+
+    fn finish(self) -> Vec<String> {
+        self.lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_meeting_answer_sdp, parse_preserved_transport_attrs};
+
+    #[test]
+    fn normalize_meeting_answer_strips_send_simulcast_and_rids() {
+        let input = "\
+v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=setup:actpass\r\n\
+a=setup:holdconn\r\n\
+a=mid:1\r\n\
+a=sendrecv\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rid:q send\r\n\
+a=rid:h send\r\n\
+a=rid:f send\r\n\
+a=simulcast:send q;h;f\r\n";
+
+        let normalized = normalize_meeting_answer_sdp(input.to_string(), None);
+
+        assert!(normalized.contains("a=setup:active\r\n"));
+        assert_eq!(normalized.matches("a=setup:active").count(), 1);
+        assert!(!normalized.contains("a=setup:actpass"));
+        assert!(!normalized.contains("a=setup:holdconn"));
+        assert!(!normalized.contains("a=rid:q send"));
+        assert!(!normalized.contains("a=rid:h send"));
+        assert!(!normalized.contains("a=rid:f send"));
+        assert!(!normalized.contains("a=simulcast:send q;h;f"));
+        assert!(normalized.contains("a=rtpmap:96 VP8/90000\r\n"));
+    }
+
+    #[test]
+    fn normalize_meeting_answer_deduplicates_transport_attrs_and_filters_unknown_payload_lines() {
+        let input = "\
+v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=ice-ufrag:first\r\n\
+a=ice-pwd:firstpwd\r\n\
+a=mid:1\r\n\
+a=rtcp-mux\r\n\
+a=setup:active\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtcp-fb:96 nack pli\r\n\
+a=ice-ufrag:second\r\n\
+a=ice-pwd:secondpwd\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=fingerprint:sha-256 11:11:11:11\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtcp-rsize\r\n\
+a=rtcp-rsize\r\n\
+a=rtcp-fb:100 nack pli\r\n\
+a=fmtp:100 apt=96\r\n\
+a=fingerprint:sha-256 22:22:22:22\r\n";
+
+        let normalized = normalize_meeting_answer_sdp(input.to_string(), None);
+
+        assert_eq!(normalized.matches("a=ice-ufrag:").count(), 1);
+        assert_eq!(normalized.matches("a=ice-pwd:").count(), 1);
+        assert_eq!(normalized.matches("a=fingerprint:").count(), 1);
+        assert_eq!(normalized.matches("a=rtcp-mux").count(), 1);
+        assert_eq!(normalized.matches("a=rtcp-rsize").count(), 1);
+        assert_eq!(normalized.matches("a=rtcp:9 IN IP4 0.0.0.0").count(), 1);
+        assert!(normalized.contains("a=rtpmap:96 VP8/90000\r\n"));
+        assert!(normalized.contains("a=rtcp-fb:96 nack pli\r\n"));
+        assert!(!normalized.contains("a=rtcp-fb:100 nack pli"));
+        assert!(!normalized.contains("a=fmtp:100 apt=96"));
+    }
+
+    #[test]
+    fn normalize_meeting_answer_preserves_previous_transport_identity() {
+        let previous = "\
+v=0\r\n\
+o=- 1 1 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=ice-ufrag:oldaudio\r\n\
+a=ice-pwd:oldaudiopwd\r\n\
+a=fingerprint:sha-256 AA:AA:AA:AA\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=ice-ufrag:oldvideo\r\n\
+a=ice-pwd:oldvideopwd\r\n\
+a=fingerprint:sha-256 BB:BB:BB:BB\r\n";
+        let current = "\
+v=0\r\n\
+o=- 1 2 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=ice-ufrag:newaudio\r\n\
+a=ice-pwd:newaudiopwd\r\n\
+a=fingerprint:sha-256 CC:CC:CC:CC\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=ice-ufrag:newvideo\r\n\
+a=ice-pwd:newvideopwd\r\n\
+a=fingerprint:sha-256 DD:DD:DD:DD\r\n";
+
+        let normalized = normalize_meeting_answer_sdp(current.to_string(), Some(previous));
+
+        assert!(normalized.contains("a=ice-ufrag:oldaudio\r\n"));
+        assert!(normalized.contains("a=ice-pwd:oldaudiopwd\r\n"));
+        assert!(normalized.contains("a=fingerprint:sha-256 AA:AA:AA:AA\r\n"));
+        assert!(normalized.contains("a=ice-ufrag:oldvideo\r\n"));
+        assert!(normalized.contains("a=ice-pwd:oldvideopwd\r\n"));
+        assert!(normalized.contains("a=fingerprint:sha-256 BB:BB:BB:BB\r\n"));
+        assert!(!normalized.contains("newaudio"));
+        assert!(!normalized.contains("newvideo"));
+        assert!(!normalized.contains("CC:CC:CC:CC"));
+        assert!(!normalized.contains("DD:DD:DD:DD"));
+    }
+
+    #[test]
+    fn parse_preserved_transport_attrs_tracks_media_section_order() {
+        let previous = "\
+v=0\r\n\
+o=- 1 1 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=ice-ufrag:audioufrag\r\n\
+a=ice-pwd:audiopwd\r\n\
+a=fingerprint:sha-256 AA:AA:AA:AA\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=ice-ufrag:videoufrag\r\n\
+a=ice-pwd:videopwd\r\n\
+a=fingerprint:sha-256 BB:BB:BB:BB\r\n";
+
+        let parsed = parse_preserved_transport_attrs(previous);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].ice_ufrag.as_deref(), Some("a=ice-ufrag:audioufrag"));
+        assert_eq!(parsed[0].ice_pwd.as_deref(), Some("a=ice-pwd:audiopwd"));
+        assert_eq!(
+            parsed[0].fingerprint.as_deref(),
+            Some("a=fingerprint:sha-256 AA:AA:AA:AA")
+        );
+        assert_eq!(parsed[1].ice_ufrag.as_deref(), Some("a=ice-ufrag:videoufrag"));
+        assert_eq!(parsed[1].ice_pwd.as_deref(), Some("a=ice-pwd:videopwd"));
+        assert_eq!(
+            parsed[1].fingerprint.as_deref(),
+            Some("a=fingerprint:sha-256 BB:BB:BB:BB")
+        );
+    }
 }
 
 fn parse_offer_sdp(sdp_txt: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {
