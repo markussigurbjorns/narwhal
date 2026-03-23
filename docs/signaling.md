@@ -74,6 +74,23 @@ Room mode rules:
 - broadcast endpoints are only valid for rooms in broadcast mode
 - if a room is already active in meeting mode, broadcast endpoints return conflict-style errors
 
+### Broadcast Session State
+
+Broadcast room mode and media session state are currently simple:
+
+| State | Meaning | Entered By | Exited By |
+| --- | --- | --- | --- |
+| empty broadcast room | room exists in broadcast mode, with no active publisher and no subscribers | `ensure_room_mode(..., Broadcast)` or a new broadcast room before publisher setup | first publisher attach or mode switch while still empty |
+| active publisher | one WHIP publisher is registered for the room | successful `POST /whip/:room` | `DELETE /whip/:room/:publisher_id` or publisher replacement |
+| active subscriber | one WHEP subscriber is registered for the room | successful `POST /whep/:room` | `DELETE /whep/:room/:subscriber_id`, slow-consumer eviction, or shutdown |
+
+Current room-mode invariants:
+
+- a non-empty broadcast room cannot be joined through meeting signaling
+- a room already active in meeting mode rejects WHIP/WHEP broadcast signaling
+- a brand-new publisher replaces the old publisher for that room
+- subscribers are independent per resource and can be deleted idempotently
+
 ### Publish With WHIP
 
 Route:
@@ -315,6 +332,24 @@ Negotiation state model:
 - a successful `sdp_offer` moves the session to `stable`
 - later session-affecting mutations can move the session to `renegotiation_required`
 - once a session is already `renegotiation_required`, additional mutations keep it there until the next successful `sdp_offer`
+
+### Meeting Session State
+
+Meeting WebSocket session state is currently:
+
+| State | Meaning | Entered By | Exited By |
+| --- | --- | --- | --- |
+| unjoined | websocket exists but has not joined a participant session | fresh `/ws` upgrade | successful `join` |
+| awaiting_initial_offer | participant joined, but this websocket session has not completed SDP negotiation yet | successful `join` | successful `sdp_offer` or socket close/`leave` |
+| stable | participant session has negotiated and is not currently dirty | successful `sdp_offer` | mutating action that changes session-visible state |
+| renegotiation_required | participant session previously negotiated and then changed published/subscribed/policy state | publish, unpublish, subscribe, unsubscribe, or policy change after `stable` | next successful `sdp_offer` |
+
+Current room-mode invariants:
+
+- one websocket session can only join one participant at a time
+- reconnect is modeled as a fresh participant session, not resume
+- a room already active in broadcast mode rejects meeting signaling
+- an empty room or empty broadcast room can be promoted into meeting mode on first successful `join`
 
 ### JSON-RPC Envelope
 

@@ -2375,6 +2375,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn meeting_join_promotes_empty_broadcast_room_to_meeting_mode() {
+        let manager = manager();
+        let room = RoomId("room-empty-broadcast-to-meeting".to_string());
+        manager.ensure_room_mode(room.clone(), RoomMode::Broadcast);
+
+        let revision = manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("empty broadcast room should allow first meeting join");
+
+        assert!(revision > 0);
+        assert_eq!(manager.room_mode(&room), Some(RoomMode::Meeting));
+        let participants = manager
+            .meeting_list_participants(room)
+            .expect("meeting participants should be listable");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].participant_id, "alice");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_join_rejects_room_with_active_broadcast_session() {
+        let manager = manager();
+        let room = RoomId("room-active-broadcast-to-meeting".to_string());
+        let publisher_peer = test_peer(&manager, "pub-peer-active-broadcast", PeerRole::WhipPublisher).await;
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Broadcast;
+            rs.publisher = Some(PublisherSession {
+                id: "publisher".to_string(),
+                peer: publisher_peer,
+                ice: IceQueue::new(),
+            });
+        }
+
+        let err = manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect_err("active broadcast room should reject meeting join");
+        let core = err
+            .downcast_ref::<Error>()
+            .expect("core error expected");
+        assert!(matches!(core, Error::RoomAlreadyActiveInBroadcastMode));
+        assert_eq!(manager.room_mode(&room), Some(RoomMode::Broadcast));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn meeting_leave_prunes_requests_and_effective_tracks() {
         let manager = manager();

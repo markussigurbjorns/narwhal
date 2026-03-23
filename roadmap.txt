@@ -21,7 +21,7 @@
 
   - it determines whether current abstractions are sufficient or whether the meeting path needs redesign now
 
-  ~ Phase 1: Stabilize Signaling And State
+  ✓ Phase 1: Stabilize Signaling And State
 
   Main code areas:
 
@@ -31,32 +31,33 @@
 
   Goals:
 
-  - formal room/session state machine
+  ✓ formal room/session state machine
   ✓ proper HTTP/WS error mapping
   ✓ idempotent cleanup
-  ~ consistent renegotiation semantics
+  ✓ consistent renegotiation semantics at the session/protocol-contract level
   ✓ stale revision handling that clients can recover from
 
   Work:
 
   ✓ replace generic 400 responses with structured mapping: 404, 409, 422, 500
-  ~ define explicit states for broadcast publisher, broadcast subscriber, meeting participant peer
+  ✓ define explicit states for broadcast publisher, broadcast subscriber, meeting participant peer
   ✓ define explicit negotiation states for meeting websocket sessions
   ✓ make leave, stop, and disconnect cleanup safe if called twice
   ✓ document and enforce revision contract for meeting updates
   ✓ reject new WHIP/WHEP/WS admissions while draining
-  ~ separate “client requested change” from “server requires renegotiation”
+  ✓ separate session-local “client requested change” from “server requires renegotiation”
+  - room-wide/server-driven renegotiation remains Phase 4 work
 
   Deliverables:
 
   ✓ docs/signaling.md
   ✓ shared error type in server
-  ~ room/session state tests in narwhal-core
+  ✓ room/session state tests in narwhal-core
   ✓ route and websocket state-machine tests in server
 
   Exit criteria:
 
-  - no ambiguous signaling behavior during join/leave/reconnect/publish/unpublish races
+  ✓ no ambiguous signaling behavior during join/leave/reconnect/publish/unpublish races for the current single-session contract
 
   ~ Phase 2: Add Production Observability
 
@@ -149,7 +150,7 @@
   Work:
 
   - serialize renegotiation per peer
-  - make server-driven renegotiation explicit
+  - make room-wide/server-driven renegotiation explicit
   - finish ICE restart handling
   - validate MID/RID/SSRC routing under simulcast
   ✓ ensure subscription changes become effective without desync
