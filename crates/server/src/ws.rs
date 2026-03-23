@@ -14,10 +14,23 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use crate::AppState;
 use crate::errors::TransportError;
 
-pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+pub async fn ws_upgrade(
+    State(state): State<AppState>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> impl IntoResponse {
+    if !state.is_ready() {
+        return state.draining_response();
+    }
+
+    let ws: WebSocketUpgrade = match ws {
+        Ok(ws) => ws,
+        Err(err) => return err.into_response(),
+    };
+
     ws.on_upgrade(move |socket| handle_socket(socket, state.rooms()))
 }
 
@@ -30,7 +43,41 @@ struct JoinedParticipant {
     room: RoomId,
     participant_id: String,
     revision: u64,
-    negotiated: bool,
+    negotiation: NegotiationState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NegotiationState {
+    AwaitingInitialOffer,
+    Stable,
+    RenegotiationRequired,
+}
+
+impl NegotiationState {
+    fn as_label(self) -> &'static str {
+        match self {
+            NegotiationState::AwaitingInitialOffer => "awaiting_initial_offer",
+            NegotiationState::Stable => "stable",
+            NegotiationState::RenegotiationRequired => "renegotiation_required",
+        }
+    }
+}
+
+impl JoinedParticipant {
+    fn note_revision_change(&mut self, revision: u64) -> bool {
+        self.revision = revision;
+        match self.negotiation {
+            NegotiationState::AwaitingInitialOffer => false,
+            NegotiationState::Stable | NegotiationState::RenegotiationRequired => {
+                self.negotiation = NegotiationState::RenegotiationRequired;
+                true
+            }
+        }
+    }
+}
+
+fn negotiation_state_label(state: NegotiationState) -> &'static str {
+    state.as_label()
 }
 
 #[derive(Deserialize)]
@@ -290,7 +337,7 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
         room: room.clone(),
         participant_id: participant_id.clone(),
         revision,
-        negotiated: false,
+        negotiation: NegotiationState::AwaitingInitialOffer,
     });
 
     info!(
@@ -303,7 +350,8 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
         "participant_id": participant_id,
         "room": room.0,
         "mode": "meeting",
-        "revision": revision
+        "revision": revision,
+        "negotiation_state": negotiation_state_label(NegotiationState::AwaitingInitialOffer)
     }))
 }
 
@@ -344,7 +392,7 @@ async fn sdp_offer(state: &mut SessionState, params: Value) -> Result<Value, Rpc
         participant_id = %joined.participant_id,
         room = %joined.room.0,
         requested_revision,
-        negotiated = joined.negotiated,
+        negotiation_state = joined.negotiation.as_label(),
         offer_sdp = %offer_sdp,
         "meeting sdp_offer received"
     );
@@ -364,18 +412,19 @@ async fn sdp_offer(state: &mut SessionState, params: Value) -> Result<Value, Rpc
         participant_id = %joined.participant_id,
         room = %joined.room.0,
         requested_revision,
-        negotiated = joined.negotiated,
+        negotiation_state = joined.negotiation.as_label(),
         answer_revision = answer.revision,
         answer_sdp = %answer.answer_sdp,
         "meeting sdp_offer answered"
     );
 
     joined.revision = answer.revision;
-    joined.negotiated = true;
+    joined.negotiation = NegotiationState::Stable;
 
     Ok(json!({
         "answer_sdp": answer.answer_sdp,
-        "revision": answer.revision
+        "revision": answer.revision,
+        "negotiation_state": negotiation_state_label(joined.negotiation)
     }))
 }
 
@@ -443,12 +492,12 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
         .rooms
         .meeting_publish_tracks(joined.room.clone(), &joined.participant_id, tracks)
         .map_err(rpc_transport_error)?;
-    joined.revision = revision;
-    let needs_renegotiation = joined.negotiated;
+    let needs_renegotiation = joined.note_revision_change(revision);
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": needs_renegotiation
+        "needs_renegotiation": needs_renegotiation,
+        "negotiation_state": negotiation_state_label(joined.negotiation)
     }))
 }
 
@@ -472,12 +521,12 @@ async fn unpublish_tracks(state: &mut SessionState, params: Value) -> Result<Val
             params.track_ids,
         )
         .map_err(rpc_transport_error)?;
-    joined.revision = revision;
-    let needs_renegotiation = joined.negotiated;
+    let needs_renegotiation = joined.note_revision_change(revision);
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": needs_renegotiation
+        "needs_renegotiation": needs_renegotiation,
+        "negotiation_state": negotiation_state_label(joined.negotiation)
     }))
 }
 
@@ -497,12 +546,12 @@ async fn subscribe(state: &mut SessionState, params: Value) -> Result<Value, Rpc
             params.track_ids,
         )
         .map_err(rpc_transport_error)?;
-    joined.revision = revision;
-    let needs_renegotiation = joined.negotiated;
+    let needs_renegotiation = joined.note_revision_change(revision);
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": needs_renegotiation
+        "needs_renegotiation": needs_renegotiation,
+        "negotiation_state": negotiation_state_label(joined.negotiation)
     }))
 }
 
@@ -522,12 +571,12 @@ async fn unsubscribe(state: &mut SessionState, params: Value) -> Result<Value, R
             params.track_ids,
         )
         .map_err(rpc_transport_error)?;
-    joined.revision = revision;
-    let needs_renegotiation = joined.negotiated;
+    let needs_renegotiation = joined.note_revision_change(revision);
 
     Ok(json!({
         "revision": revision,
-        "needs_renegotiation": needs_renegotiation
+        "needs_renegotiation": needs_renegotiation,
+        "negotiation_state": negotiation_state_label(joined.negotiation)
     }))
 }
 
@@ -668,13 +717,13 @@ async fn set_policy_mode(state: &mut SessionState, params: Value) -> Result<Valu
         .rooms
         .meeting_set_policy_mode(joined.room.clone(), mode)
         .map_err(rpc_transport_error)?;
-    joined.revision = revision;
-    let needs_renegotiation = joined.negotiated;
+    let needs_renegotiation = joined.note_revision_change(revision);
 
     Ok(json!({
         "mode": policy_mode_label(mode),
         "revision": revision,
-        "needs_renegotiation": needs_renegotiation
+        "needs_renegotiation": needs_renegotiation,
+        "negotiation_state": negotiation_state_label(joined.negotiation)
     }))
 }
 
@@ -712,8 +761,9 @@ fn rpc_core_error(err: CoreError) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::{
-        JoinedParticipant, SessionState, cleanup_joined_session, handle_text, join, leave,
-        list_participants, list_subscriptions, publish_tracks, sdp_offer, subscribe, unsubscribe,
+        JoinedParticipant, NegotiationState, SessionState, cleanup_joined_session, handle_text,
+        join, leave, list_participants, list_subscriptions, publish_tracks, sdp_offer,
+        set_policy_mode, subscribe, unsubscribe,
     };
     use media::GstRuntime;
     use narwhal_core::{MediaKind, MeetingPublishTrack, RoomId, RoomManager};
@@ -722,6 +772,24 @@ mod tests {
     fn manager() -> RoomManager {
         let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
         RoomManager::new(gst)
+    }
+
+    fn awaiting_participant(room: RoomId, participant_id: &str, revision: u64) -> JoinedParticipant {
+        JoinedParticipant {
+            room,
+            participant_id: participant_id.to_string(),
+            revision,
+            negotiation: NegotiationState::AwaitingInitialOffer,
+        }
+    }
+
+    fn stable_participant(room: RoomId, participant_id: &str, revision: u64) -> JoinedParticipant {
+        JoinedParticipant {
+            room,
+            participant_id: participant_id.to_string(),
+            revision,
+            negotiation: NegotiationState::Stable,
+        }
     }
 
     fn browser_like_offer_sdp() -> String {
@@ -773,12 +841,11 @@ a=ssrc:5678 msid:test video0\r\n"
     async fn join_rejects_when_session_already_joined() {
         let mut state = SessionState {
             rooms: manager(),
-            joined: Some(JoinedParticipant {
-                room: RoomId("room-a".to_string()),
-                participant_id: "participant-a".to_string(),
-                revision: 1,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(
+                RoomId("room-a".to_string()),
+                "participant-a",
+                1,
+            )),
         };
 
         let err = join(
@@ -845,12 +912,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut state = SessionState {
             rooms,
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "alice".to_string(),
-                revision: alice_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "alice", alice_revision)),
         };
 
         let publish_result = publish_tracks(
@@ -877,12 +939,7 @@ a=ssrc:5678 msid:test video0\r\n"
             .expect("revision present");
         assert!(publish_revision > bob_revision);
 
-        state.joined = Some(JoinedParticipant {
-            room,
-            participant_id: "bob".to_string(),
-            revision: bob_revision,
-            negotiated: false,
-        });
+        state.joined = Some(awaiting_participant(room, "bob", bob_revision));
 
         let subscribe_result = subscribe(
             &mut state,
@@ -913,12 +970,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut state = SessionState {
             rooms,
-            joined: Some(JoinedParticipant {
-                room,
-                participant_id: "alice".to_string(),
-                revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room, "alice", revision)),
         };
 
         let err = sdp_offer(
@@ -945,12 +997,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut state = SessionState {
             rooms,
-            joined: Some(JoinedParticipant {
-                room,
-                participant_id: "alice".to_string(),
-                revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room, "alice", revision)),
         };
 
         let result = sdp_offer(
@@ -970,6 +1017,26 @@ a=ssrc:5678 msid:test video0\r\n"
                 .contains("m=audio")
         );
         assert_eq!(result["revision"], json!(revision));
+        assert_eq!(result["negotiation_state"], json!("stable"));
+    }
+
+    #[test]
+    fn revision_changes_only_require_renegotiation_after_session_is_stable() {
+        let room = RoomId("meeting-negotiation-state".to_string());
+
+        let mut awaiting = awaiting_participant(room.clone(), "alice", 1);
+        assert!(!awaiting.note_revision_change(2));
+        assert_eq!(awaiting.revision, 2);
+        assert_eq!(awaiting.negotiation, NegotiationState::AwaitingInitialOffer);
+
+        let mut stable = stable_participant(room, "alice", 2);
+        assert!(stable.note_revision_change(3));
+        assert_eq!(stable.revision, 3);
+        assert_eq!(stable.negotiation, NegotiationState::RenegotiationRequired);
+
+        assert!(stable.note_revision_change(4));
+        assert_eq!(stable.revision, 4);
+        assert_eq!(stable.negotiation, NegotiationState::RenegotiationRequired);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -985,12 +1052,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut bob_state = SessionState {
             rooms: rooms.clone(),
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
         };
 
         sdp_offer(
@@ -1036,6 +1098,10 @@ a=ssrc:5678 msid:test video0\r\n"
             .expect("revision present");
         assert!(subscribe_revision > publish_revision);
         assert_eq!(subscribe_result["needs_renegotiation"], json!(true));
+        assert_eq!(
+            subscribe_result["negotiation_state"],
+            json!("renegotiation_required")
+        );
 
         let renegotiated = sdp_offer(
             &mut bob_state,
@@ -1069,12 +1135,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut bob_state = SessionState {
             rooms: rooms.clone(),
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
         };
 
         let initial = sdp_offer(
@@ -1186,12 +1247,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut bob_state = SessionState {
             rooms,
-            joined: Some(JoinedParticipant {
-                room,
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room, "bob", bob_revision)),
         };
 
         let subscribe_result = subscribe(
@@ -1268,12 +1324,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut bob_state = SessionState {
             rooms: rooms.clone(),
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
         };
 
         let first_subscribe = subscribe(
@@ -1379,12 +1430,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut state = SessionState {
             rooms,
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
         };
 
         let subscribe_result = subscribe(
@@ -1399,6 +1445,10 @@ a=ssrc:5678 msid:test video0\r\n"
             .as_u64()
             .expect("revision present");
         assert_eq!(subscribe_result["needs_renegotiation"], json!(false));
+        assert_eq!(
+            subscribe_result["negotiation_state"],
+            json!("awaiting_initial_offer")
+        );
 
         let subscriptions_after_subscribe = list_subscriptions(&mut state)
             .await
@@ -1425,6 +1475,10 @@ a=ssrc:5678 msid:test video0\r\n"
             .expect("revision present");
         assert!(unsubscribe_revision > subscribe_revision);
         assert_eq!(unsubscribe_result["needs_renegotiation"], json!(false));
+        assert_eq!(
+            unsubscribe_result["negotiation_state"],
+            json!("awaiting_initial_offer")
+        );
 
         let subscriptions_after_unsubscribe = list_subscriptions(&mut state)
             .await
@@ -1436,6 +1490,172 @@ a=ssrc:5678 msid:test video0\r\n"
         assert_eq!(
             subscriptions_after_unsubscribe["effective_track_ids"],
             json!(["alice-audio"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_mutations_before_initial_offer_remain_awaiting_initial_offer() {
+        let rooms = manager();
+        let room = RoomId("meeting-awaiting-offer-repeats".to_string());
+        rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(awaiting_participant(room, "bob", bob_revision)),
+        };
+
+        let first_subscribe = subscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-audio"]
+            }),
+        )
+        .await
+        .expect("first subscribe should succeed");
+        assert_eq!(first_subscribe["needs_renegotiation"], json!(false));
+        assert_eq!(
+            first_subscribe["negotiation_state"],
+            json!("awaiting_initial_offer")
+        );
+
+        let second_subscribe = subscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-video"]
+            }),
+        )
+        .await
+        .expect("second subscribe should succeed");
+        assert_eq!(second_subscribe["needs_renegotiation"], json!(false));
+        assert_eq!(
+            second_subscribe["negotiation_state"],
+            json!("awaiting_initial_offer")
+        );
+
+        let policy_change = set_policy_mode(
+            &mut state,
+            json!({
+                "mode": "low_bandwidth"
+            }),
+        )
+        .await
+        .expect("policy change should succeed");
+        assert_eq!(policy_change["needs_renegotiation"], json!(false));
+        assert_eq!(
+            policy_change["negotiation_state"],
+            json!("awaiting_initial_offer")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_mutations_while_dirty_remain_renegotiation_required() {
+        let rooms = manager();
+        let room = RoomId("meeting-dirty-repeats".to_string());
+        rooms
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let bob_revision = rooms
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+
+        rooms
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![
+                    MeetingPublishTrack {
+                        track_id: "alice-audio".to_string(),
+                        media_kind: MediaKind::Audio,
+                        mid: Some("0".to_string()),
+                    },
+                    MeetingPublishTrack {
+                        track_id: "alice-video".to_string(),
+                        media_kind: MediaKind::Video,
+                        mid: Some("1".to_string()),
+                    },
+                ],
+            )
+            .expect("alice publishes");
+
+        let mut state = SessionState {
+            rooms,
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
+        };
+
+        sdp_offer(
+            &mut state,
+            json!({
+                "revision": bob_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await
+        .expect("initial negotiation should succeed");
+
+        let first_subscribe = subscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-audio"]
+            }),
+        )
+        .await
+        .expect("first subscribe should succeed");
+        assert_eq!(first_subscribe["needs_renegotiation"], json!(true));
+        assert_eq!(
+            first_subscribe["negotiation_state"],
+            json!("renegotiation_required")
+        );
+
+        let second_subscribe = subscribe(
+            &mut state,
+            json!({
+                "track_ids": ["alice-video"]
+            }),
+        )
+        .await
+        .expect("second subscribe should succeed");
+        assert_eq!(second_subscribe["needs_renegotiation"], json!(true));
+        assert_eq!(
+            second_subscribe["negotiation_state"],
+            json!("renegotiation_required")
+        );
+
+        let policy_change = set_policy_mode(
+            &mut state,
+            json!({
+                "mode": "low_bandwidth"
+            }),
+        )
+        .await
+        .expect("policy change should succeed");
+        assert_eq!(policy_change["needs_renegotiation"], json!(true));
+        assert_eq!(
+            policy_change["negotiation_state"],
+            json!("renegotiation_required")
         );
     }
 
@@ -1465,12 +1685,11 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut first_state = SessionState {
             rooms: rooms.clone(),
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: first_participant_id.clone(),
-                revision: first_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(
+                room.clone(),
+                &first_participant_id,
+                first_revision,
+            )),
         };
 
         let before_cleanup = list_participants(&mut first_state)
@@ -1545,12 +1764,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut bob_state = SessionState {
             rooms: rooms.clone(),
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
         };
 
         subscribe(
@@ -1612,12 +1826,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut bob_state = SessionState {
             rooms: rooms.clone(),
-            joined: Some(JoinedParticipant {
-                room: room.clone(),
-                participant_id: "bob".to_string(),
-                revision: bob_revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
         };
 
         let first_subscribe = subscribe(
@@ -1696,12 +1905,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
         let mut state = SessionState {
             rooms,
-            joined: Some(JoinedParticipant {
-                room,
-                participant_id: "alice".to_string(),
-                revision,
-                negotiated: false,
-            }),
+            joined: Some(awaiting_participant(room, "alice", revision)),
         };
 
         sdp_offer(
@@ -1730,5 +1934,9 @@ a=ssrc:5678 msid:test video0\r\n"
         .expect("publish should succeed");
 
         assert_eq!(publish_result["needs_renegotiation"], json!(true));
+        assert_eq!(
+            publish_result["negotiation_state"],
+            json!("renegotiation_required")
+        );
     }
 }

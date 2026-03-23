@@ -88,6 +88,16 @@ impl AppState {
         }
         ready
     }
+
+    pub fn draining_response(&self) -> axum::response::Response {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "server is draining and not accepting new sessions"
+            })),
+        )
+            .into_response()
+    }
 }
 
 pub fn app(rooms: RoomManager) -> Router {
@@ -178,6 +188,10 @@ async fn whip_post(
     Path(room): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
+    if !state.is_ready() {
+        return state.draining_response();
+    }
+
     let offer_sdp = match std::str::from_utf8(&body) {
         Ok(s) => s.to_string(),
         Err(_) => return TransportError::invalid_request("invalid utf8 SDP").into_response(),
@@ -199,6 +213,10 @@ async fn whep_post(
     Path(room): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
+    if !state.is_ready() {
+        return state.draining_response();
+    }
+
     let offer_sdp = match std::str::from_utf8(&body) {
         Ok(s) => s.to_string(),
         Err(_) => return TransportError::invalid_request("invalid utf8 SDP").into_response(),
@@ -620,6 +638,62 @@ a=rtpmap:96 VP8/90000\r\n"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn whip_post_returns_service_unavailable_when_draining() {
+        let state = AppState::new(manager());
+        state.mark_draining();
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/draining-room")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json,
+            json!({ "error": "server is draining and not accepting new sessions" })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_returns_service_unavailable_when_draining() {
+        let state = AppState::new(manager());
+        state.mark_draining();
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/draining-room")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json,
+            json!({ "error": "server is draining and not accepting new sessions" })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn broadcast_policy_endpoint_returns_not_found_for_missing_room() {
         let response = app(manager())
             .oneshot(
@@ -778,6 +852,53 @@ a=rtpmap:96 VP8/90000\r\n"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn whip_delete_is_idempotent_for_already_stopped_publisher() {
+        let rooms = manager();
+        let publish_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whip-delete")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        let location = publish_response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8")
+            .to_string();
+
+        let first_delete = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("first delete response available");
+        assert_eq!(first_delete.status(), StatusCode::NO_CONTENT);
+
+        let second_delete = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("second delete response available");
+        assert_eq!(second_delete.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn whep_post_returns_unprocessable_with_real_sdp_when_publisher_not_flowing() {
         let rooms = manager();
         let publisher_response = app(rooms.clone())
@@ -867,6 +988,72 @@ a=rtpmap:96 VP8/90000\r\n"
         let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
         assert!(answer.contains("m=audio"));
         assert!(answer.contains("m=video"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_delete_is_idempotent_for_already_stopped_subscriber() {
+        let rooms = manager();
+        let publisher_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whep-delete")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(publisher_response.status(), StatusCode::CREATED);
+
+        rooms
+            .seed_broadcast_streams_for_test(RoomId("broadcast-whep-delete".to_string()))
+            .expect("seeded broadcast streams");
+
+        let subscribe_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/broadcast-whep-delete")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(subscribe_response.status(), StatusCode::CREATED);
+
+        let location = subscribe_response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8")
+            .to_string();
+
+        let first_delete = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("first delete response available");
+        assert_eq!(first_delete.status(), StatusCode::NO_CONTENT);
+
+        let second_delete = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("second delete response available");
+        assert_eq!(second_delete.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1007,6 +1194,7 @@ a=rtpmap:96 VP8/90000\r\n"
             .as_str()
             .expect("alice participant id")
             .to_string();
+        assert_eq!(alice_join["negotiation_state"], json!("awaiting_initial_offer"));
 
         let bob_join = ws_rpc(
             &mut bob,
@@ -1036,6 +1224,7 @@ a=rtpmap:96 VP8/90000\r\n"
                 .expect("answer sdp")
                 .contains("m=audio")
         );
+        assert_eq!(bob_initial_offer["negotiation_state"], json!("stable"));
         let bob_initial_trickle = ws_rpc(
             &mut bob,
             31,
@@ -1092,6 +1281,7 @@ a=rtpmap:96 VP8/90000\r\n"
             .as_u64()
             .expect("subscribe revision");
         assert_eq!(bob_subscribe["needs_renegotiation"], json!(false));
+        assert_eq!(bob_subscribe["negotiation_state"], json!("awaiting_initial_offer"));
 
         let bob_renegotiated = ws_rpc(
             &mut bob,
@@ -1229,5 +1419,36 @@ a=rtpmap:96 VP8/90000\r\n"
             .await
             .expect("alice rejoined close succeeds");
         server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_upgrade_returns_service_unavailable_when_draining() {
+        let state = AppState::new(manager());
+        state.mark_draining();
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ws")
+                    .method("GET")
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json,
+            json!({ "error": "server is draining and not accepting new sessions" })
+        );
     }
 }

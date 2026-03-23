@@ -824,6 +824,13 @@ impl RoomManager {
             let mut g = self.inner.write();
             let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
+            if !rs
+                .meeting
+                .participants
+                .contains_key(&ParticipantId(participant_id.to_string()))
+            {
+                return Ok(());
+            }
             let participant = Self::remove_meeting_participant_state(rs, participant_id)
                 .map_err(|_| meeting_participant_session_not_found())?;
             rs.meeting.next_revision();
@@ -1679,18 +1686,22 @@ impl RoomManager {
             let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
 
-            let cur = rs.publisher.as_ref().ok_or_else(no_publisher)?;
+            let Some(cur) = rs.publisher.as_ref() else {
+                return Ok(());
+            };
             if cur.id != pub_id {
                 return Err(publisher_id_mismatch());
             }
 
             rs.broadcast_streams.clear();
             Self::recompute_broadcast_graph(rs);
-            rs.publisher.take().unwrap()
+            rs.publisher.take()
         };
 
-        pub_sess.peer.stop().await?;
-        self.metrics.inc_broadcast_publishers_stopped();
+        if let Some(pub_sess) = pub_sess {
+            pub_sess.peer.stop().await?;
+            self.metrics.inc_broadcast_publishers_stopped();
+        }
         Ok(())
     }
 
@@ -1847,15 +1858,16 @@ impl RoomManager {
             let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_broadcast_mode(rs)?;
 
-            let sub = Self::remove_broadcast_subscriber_state(rs, sub_id)
-                .ok_or_else(subscriber_not_found)?;
+            let sub = Self::remove_broadcast_subscriber_state(rs, sub_id);
             Self::recompute_broadcast_graph(rs);
             sub
         };
 
         // stop media outside lock
-        sub.peer.stop().await?;
-        self.metrics.inc_broadcast_subscribers_stopped();
+        if let Some(sub) = sub {
+            sub.peer.stop().await?;
+            self.metrics.inc_broadcast_subscribers_stopped();
+        }
         Ok(())
     }
 }
@@ -2389,6 +2401,28 @@ mod tests {
         assert!(publications.is_empty());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_leave_is_idempotent_for_already_removed_participant() {
+        let manager = manager();
+        let room = RoomId("room-leave-idempotent".to_string());
+        join_publish_and_subscribe(&manager, &room);
+
+        manager
+            .meeting_leave(room.clone(), "alice")
+            .await
+            .expect("first leave should succeed");
+        manager
+            .meeting_leave(room.clone(), "alice")
+            .await
+            .expect("second leave should be a no-op");
+
+        let participants = manager
+            .meeting_list_participants(room)
+            .expect("remaining participants should be listable");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].participant_id, "bob");
+    }
+
     #[test]
     fn observed_streams_are_tracked_by_ssrc() {
         let manager = manager();
@@ -2535,6 +2569,69 @@ mod tests {
             "narwhal_subscriber_evictions_total{mode=\"broadcast\",reason=\"slow_consumer\"} 1"
         ));
         assert!(rendered.contains("narwhal_broadcast_subscribers_stopped_total 1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whip_stop_is_idempotent_when_publisher_is_already_gone() {
+        let manager = manager();
+        let room = RoomId("broadcast-stop-idempotent".to_string());
+        let publisher_peer = test_peer(&manager, "pub-peer-stop", PeerRole::WhipPublisher).await;
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Broadcast;
+            rs.publisher = Some(PublisherSession {
+                id: "publisher".to_string(),
+                peer: publisher_peer,
+                ice: IceQueue::new(),
+            });
+        }
+
+        manager
+            .whip_stop(room.clone(), "publisher")
+            .await
+            .expect("first stop should succeed");
+        manager
+            .whip_stop(room.clone(), "publisher")
+            .await
+            .expect("second stop should be a no-op");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_stop_is_idempotent_when_subscriber_is_already_gone() {
+        let manager = manager();
+        let room = RoomId("broadcast-sub-stop-idempotent".to_string());
+        let subscriber_peer = test_peer(&manager, "sub-peer-stop", PeerRole::WhepSubscriber).await;
+        let (tx, _rx) = mpsc::channel(1);
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Broadcast;
+            rs.subscribers.insert(
+                "subscriber".to_string(),
+                SubscriberSession {
+                    id: "subscriber".to_string(),
+                    peer: subscriber_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: tx,
+                    injector_overflow_streak: 0,
+                    subscribed_at: Instant::now(),
+                    first_rtp_forwarded: false,
+                    first_video_keyframe_forwarded: false,
+                },
+            );
+        }
+
+        manager
+            .whep_stop(room.clone(), "subscriber")
+            .await
+            .expect("first stop should succeed");
+        manager
+            .whep_stop(room.clone(), "subscriber")
+            .await
+            .expect("second stop should be a no-op");
     }
 
     #[test]

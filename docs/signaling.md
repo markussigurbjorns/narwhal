@@ -28,6 +28,7 @@ HTTP endpoints use these status classes:
 - `200 OK`
 - `201 Created`
 - `204 No Content`
+- `503 Service Unavailable`
 - `404 Not Found`
 - `409 Conflict`
 - `422 Unprocessable Entity`
@@ -49,6 +50,20 @@ Meeting JSON-RPC uses:
   - `5000` internal error
 
 Those codes are derived from the shared core error taxonomy.
+
+Drain-mode admission behavior:
+
+- during graceful shutdown drain, new session admission is rejected
+- `POST /whip/:room`
+- `POST /whep/:room`
+- `GET /ws`
+- these currently return `503` with:
+
+```json
+{ "error": "server is draining and not accepting new sessions" }
+```
+
+Existing sessions can still continue cleanup-oriented operations during drain, such as `DELETE`, ICE drain, and leave handling.
 
 ## Broadcast Signaling
 
@@ -133,6 +148,7 @@ Notes:
 
 - current behavior is replace-on-new-publisher
 - starting a new publisher replaces the previous one for the room
+- deleting the same publisher resource more than once is treated as a no-op
 
 ### Subscribe With WHEP
 
@@ -210,6 +226,10 @@ Success response:
 
 - `204 No Content`
 
+Notes:
+
+- deleting the same subscriber resource more than once is treated as a no-op
+
 ## Broadcast Control API
 
 These routes are read/write control endpoints for broadcast rooms.
@@ -284,6 +304,18 @@ Current model:
 - if the WebSocket closes, the server treats that as participant leave
 - reconnect is currently a fresh join, not session resume
 
+Negotiation state model:
+
+- each joined WebSocket session tracks its own negotiation state
+- current values are:
+  - `awaiting_initial_offer`
+  - `stable`
+  - `renegotiation_required`
+- the initial `join` state is `awaiting_initial_offer`
+- a successful `sdp_offer` moves the session to `stable`
+- later session-affecting mutations can move the session to `renegotiation_required`
+- once a session is already `renegotiation_required`, additional mutations keep it there until the next successful `sdp_offer`
+
 ### JSON-RPC Envelope
 
 Request:
@@ -345,7 +377,8 @@ Success result:
   "participant_id": "uuid",
   "room": "demo-room",
   "mode": "meeting",
-  "revision": 1
+  "revision": 1,
+  "negotiation_state": "awaiting_initial_offer"
 }
 ```
 
@@ -388,7 +421,8 @@ Success result:
 ```json
 {
   "answer_sdp": "v=0...",
-  "revision": 1
+  "revision": 1,
+  "negotiation_state": "stable"
 }
 ```
 
@@ -461,15 +495,17 @@ Success result:
 ```json
 {
   "revision": 2,
-  "needs_renegotiation": false
+  "needs_renegotiation": false,
+  "negotiation_state": "awaiting_initial_offer"
 }
 ```
 
 Current behavior:
 
 - publishing increments room revision
-- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
-- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for publish changes
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false` and `negotiation_state` remains `awaiting_initial_offer`
+- after this WebSocket session has successfully negotiated once, publish changes return `needs_renegotiation: true` and `negotiation_state: "renegotiation_required"`
+- repeated publish/unpublish/subscribe/unsubscribe/policy mutations while already dirty keep `negotiation_state` at `renegotiation_required`
 
 #### `unpublish_tracks`
 
@@ -486,7 +522,8 @@ Success result:
 ```json
 {
   "revision": 3,
-  "needs_renegotiation": false
+  "needs_renegotiation": false,
+  "negotiation_state": "awaiting_initial_offer"
 }
 ```
 
@@ -505,7 +542,8 @@ Success result:
 ```json
 {
   "revision": 4,
-  "needs_renegotiation": false
+  "needs_renegotiation": false,
+  "negotiation_state": "awaiting_initial_offer"
 }
 ```
 
@@ -514,8 +552,8 @@ Notes:
 - requested tracks are validated against currently known publications
 - subscription policy may reduce the effective set relative to the requested set
 - subscribing increments room revision
-- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
-- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for subscribe changes
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false` and `negotiation_state` remains `awaiting_initial_offer`
+- after this WebSocket session has successfully negotiated once, subscribe changes return `needs_renegotiation: true` and `negotiation_state: "renegotiation_required"`
 
 #### `unsubscribe`
 
@@ -532,15 +570,16 @@ Success result:
 ```json
 {
   "revision": 5,
-  "needs_renegotiation": false
+  "needs_renegotiation": false,
+  "negotiation_state": "awaiting_initial_offer"
 }
 ```
 
 Current behavior:
 
 - unsubscribing increments room revision
-- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
-- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for unsubscribe changes
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false` and `negotiation_state` remains `awaiting_initial_offer`
+- after this WebSocket session has successfully negotiated once, unsubscribe changes return `needs_renegotiation: true` and `negotiation_state: "renegotiation_required"`
 
 #### `list_participants`
 
@@ -636,14 +675,15 @@ Success result:
 {
   "mode": "low_bandwidth",
   "revision": 6,
-  "needs_renegotiation": false
+  "needs_renegotiation": false,
+  "negotiation_state": "awaiting_initial_offer"
 }
 ```
 
 Current behavior:
 
-- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false`
-- after this WebSocket session has successfully negotiated once, `needs_renegotiation` becomes `true` for policy changes
+- if this WebSocket session has not completed `sdp_offer` yet, `needs_renegotiation` remains `false` and `negotiation_state` remains `awaiting_initial_offer`
+- after this WebSocket session has successfully negotiated once, policy changes return `needs_renegotiation: true` and `negotiation_state: "renegotiation_required"`
 
 ## Revision Semantics
 
@@ -659,14 +699,14 @@ Current behavior:
 
 Current limitation:
 
-- the API already returns `revision`, and `needs_renegotiation` is now session-aware, but renegotiation is still not fully modeled server-wide
-- `needs_renegotiation` currently reflects whether the caller's own session has already negotiated and then mutated state
+- the API now returns `revision`, `needs_renegotiation`, and a session-local `negotiation_state`, but renegotiation is still not fully modeled server-wide
+- `needs_renegotiation` and `negotiation_state` currently reflect the caller's own session state only
 - clients should treat revision as authoritative room state versioning, but not as a finished renegotiation protocol for every participant in the room
 
 ## Current Limitations
 
 - there is no server-push event stream for room changes; clients poll via RPC methods
 - ICE is drained by explicit client polling
-- meeting renegotiation semantics are still incomplete
+- meeting renegotiation semantics are session-local and still incomplete at the room-wide orchestration level
 - broadcast subscribe currently requires the publisher to already be flowing RTP
 - status codes and JSON-RPC error codes are stable enough for current tests, but the protocol should still be considered evolving

@@ -33,7 +33,7 @@
 
   - formal room/session state machine
   ✓ proper HTTP/WS error mapping
-  ~ idempotent cleanup
+  ✓ idempotent cleanup
   ~ consistent renegotiation semantics
   ✓ stale revision handling that clients can recover from
 
@@ -41,8 +41,10 @@
 
   ✓ replace generic 400 responses with structured mapping: 404, 409, 422, 500
   ~ define explicit states for broadcast publisher, broadcast subscriber, meeting participant peer
-  ~ make leave, stop, and disconnect cleanup safe if called twice
+  ✓ define explicit negotiation states for meeting websocket sessions
+  ✓ make leave, stop, and disconnect cleanup safe if called twice
   ✓ document and enforce revision contract for meeting updates
+  ✓ reject new WHIP/WHEP/WS admissions while draining
   ~ separate “client requested change” from “server requires renegotiation”
 
   Deliverables:
@@ -50,6 +52,7 @@
   ✓ docs/signaling.md
   ✓ shared error type in server
   ~ room/session state tests in narwhal-core
+  ✓ route and websocket state-machine tests in server
 
   Exit criteria:
 
