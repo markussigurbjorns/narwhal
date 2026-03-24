@@ -10,6 +10,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::{
     sync::{
         Arc, Mutex,
@@ -21,9 +22,137 @@ use std::{
 use self::errors::TransportError;
 use narwhal_core::{BroadcastPolicyMode, RoomId, RoomManager};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeetingNegotiationState {
+    AwaitingInitialOffer,
+    Stable,
+    RenegotiationRequired,
+}
+
+impl MeetingNegotiationState {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            MeetingNegotiationState::AwaitingInitialOffer => "awaiting_initial_offer",
+            MeetingNegotiationState::Stable => "stable",
+            MeetingNegotiationState::RenegotiationRequired => "renegotiation_required",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MeetingRenegotiationNotification {
+    pub revision: u64,
+    pub reason: &'static str,
+    pub negotiation_state: MeetingNegotiationState,
+}
+
+#[derive(Clone, Default)]
+pub struct MeetingSessionRegistry {
+    inner: Arc<Mutex<HashMap<String, HashMap<String, RegisteredMeetingSession>>>>,
+}
+
+#[derive(Clone)]
+struct RegisteredMeetingSession {
+    tx: tokio::sync::mpsc::UnboundedSender<MeetingRenegotiationNotification>,
+    negotiation_state: MeetingNegotiationState,
+}
+
+impl MeetingSessionRegistry {
+    pub fn register(
+        &self,
+        room: &RoomId,
+        participant_id: &str,
+        tx: tokio::sync::mpsc::UnboundedSender<MeetingRenegotiationNotification>,
+    ) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .entry(room.0.clone())
+                .or_default()
+                .insert(
+                    participant_id.to_string(),
+                    RegisteredMeetingSession {
+                        tx,
+                        negotiation_state: MeetingNegotiationState::AwaitingInitialOffer,
+                    },
+                );
+        }
+    }
+
+    pub fn unregister(&self, room: &RoomId, participant_id: &str) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(room_sessions) = inner.get_mut(&room.0)
+        {
+            room_sessions.remove(participant_id);
+            if room_sessions.is_empty() {
+                inner.remove(&room.0);
+            }
+        }
+    }
+
+    pub fn set_negotiation_state(
+        &self,
+        room: &RoomId,
+        participant_id: &str,
+        negotiation_state: MeetingNegotiationState,
+    ) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(room_sessions) = inner.get_mut(&room.0)
+            && let Some(session) = room_sessions.get_mut(participant_id)
+        {
+            session.negotiation_state = negotiation_state;
+        }
+    }
+
+    pub fn notify_participants(
+        &self,
+        room: &RoomId,
+        participant_ids: &[String],
+        revision: u64,
+        reason: &'static str,
+    ) {
+        let mut stale = Vec::new();
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(room_sessions) = inner.get_mut(&room.0)
+        {
+            for participant_id in participant_ids {
+                let Some(session) = room_sessions.get_mut(participant_id) else {
+                    continue;
+                };
+                if matches!(
+                    session.negotiation_state,
+                    MeetingNegotiationState::AwaitingInitialOffer
+                ) {
+                    continue;
+                }
+
+                session.negotiation_state = MeetingNegotiationState::RenegotiationRequired;
+                if session
+                    .tx
+                    .send(MeetingRenegotiationNotification {
+                        revision,
+                        reason,
+                        negotiation_state: MeetingNegotiationState::RenegotiationRequired,
+                    })
+                    .is_err()
+                {
+                    stale.push(participant_id.clone());
+                }
+            }
+
+            for participant_id in stale {
+                room_sessions.remove(&participant_id);
+            }
+            if room_sessions.is_empty() {
+                inner.remove(&room.0);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     rooms: RoomManager,
+    meeting_sessions: MeetingSessionRegistry,
     ready: Arc<AtomicBool>,
     readiness_cache: Arc<Mutex<Option<ReadinessCacheEntry>>>,
     readiness_cache_ttl: Duration,
@@ -43,6 +172,7 @@ impl AppState {
     pub fn with_readiness_cache_ttl(rooms: RoomManager, readiness_cache_ttl: Duration) -> Self {
         Self {
             rooms,
+            meeting_sessions: MeetingSessionRegistry::default(),
             ready: Arc::new(AtomicBool::new(true)),
             readiness_cache: Arc::new(Mutex::new(None)),
             readiness_cache_ttl,
@@ -51,6 +181,10 @@ impl AppState {
 
     pub fn rooms(&self) -> RoomManager {
         self.rooms.clone()
+    }
+
+    pub fn meeting_sessions(&self) -> MeetingSessionRegistry {
+        self.meeting_sessions.clone()
     }
 
     pub fn mark_draining(&self) {
@@ -548,6 +682,20 @@ a=rtpmap:96 VP8/90000\r\n"
             panic!("rpc {method} failed: {error}");
         }
         response["result"].clone()
+    }
+
+    async fn ws_next_json(
+        ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    ) -> Value {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("websocket frame should arrive before timeout")
+            .expect("response frame")
+            .expect("ws frame");
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).expect("json frame")
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1418,6 +1566,129 @@ a=rtpmap:96 VP8/90000\r\n"
             .close(None)
             .await
             .expect("alice rejoined close succeeds");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_route_pushes_room_wide_renegotiation_notifications() {
+        let rooms = manager();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+        let mut bob = ws_connect(&ws_url).await;
+
+        let _alice_join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-room-wide-renegotiation",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+
+        let bob_join = ws_rpc(
+            &mut bob,
+            2,
+            "join",
+            json!({
+                "room": "ws-room-wide-renegotiation",
+                "display_name": "Bob"
+            }),
+        )
+        .await;
+        let bob_join_revision = bob_join["revision"].as_u64().expect("bob join revision");
+
+        let _alice_publish = ws_rpc(
+            &mut alice,
+            3,
+            "publish_tracks",
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-audio-v1",
+                        "media_kind": "audio",
+                        "mid": "0"
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let _bob_initial_offer = ws_rpc(
+            &mut bob,
+            4,
+            "sdp_offer",
+            json!({
+                "revision": bob_join_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        let bob_subscribe = ws_rpc(
+            &mut bob,
+            5,
+            "subscribe",
+            json!({
+                "track_ids": ["alice-audio-v1"]
+            }),
+        )
+        .await;
+        assert_eq!(bob_subscribe["needs_renegotiation"], json!(true));
+        let bob_subscribe_revision = bob_subscribe["revision"]
+            .as_u64()
+            .expect("bob subscribe revision");
+
+        let _bob_reoffer = ws_rpc(
+            &mut bob,
+            6,
+            "sdp_offer",
+            json!({
+                "revision": bob_subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        let alice_unpublish = ws_rpc(
+            &mut alice,
+            7,
+            "unpublish_tracks",
+            json!({
+                "track_ids": ["alice-audio-v1"]
+            }),
+        )
+        .await;
+        assert_eq!(alice_unpublish["needs_renegotiation"], json!(false));
+
+        let notification = ws_next_json(&mut bob).await;
+        assert_eq!(notification["jsonrpc"], json!("2.0"));
+        assert_eq!(notification["method"], json!("renegotiation_required"));
+        assert_eq!(
+            notification["params"]["reason"],
+            json!("tracks_unpublished")
+        );
+        assert_eq!(
+            notification["params"]["negotiation_state"],
+            json!("renegotiation_required")
+        );
+        assert_eq!(
+            notification["params"]["revision"],
+            alice_unpublish["revision"]
+        );
+
+        let bob_state_after_notification = ws_rpc(&mut bob, 8, "list_subscriptions", json!({})).await;
+        assert_eq!(bob_state_after_notification["requested_track_ids"], json!([]));
+        assert_eq!(bob_state_after_notification["effective_track_ids"], json!([]));
+
+        alice.close(None).await.expect("alice close succeeds");
+        bob.close(None).await.expect("bob close succeeds");
         server_handle.abort();
     }
 

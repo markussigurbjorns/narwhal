@@ -11,11 +11,14 @@ use narwhal_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use crate::AppState;
+use crate::{
+    AppState, MeetingNegotiationState, MeetingRenegotiationNotification, MeetingSessionRegistry,
+};
 use crate::errors::TransportError;
 
 pub async fn ws_upgrade(
@@ -31,11 +34,13 @@ pub async fn ws_upgrade(
         Err(err) => return err.into_response(),
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms()))
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 struct SessionState {
     rooms: RoomManager,
+    meeting_sessions: MeetingSessionRegistry,
+    notifications_tx: mpsc::UnboundedSender<MeetingRenegotiationNotification>,
     joined: Option<JoinedParticipant>,
 }
 
@@ -198,60 +203,167 @@ struct SetPolicyModeParams {
     mode: WireMeetingPolicyMode,
 }
 
-async fn handle_socket(mut socket: WebSocket, rooms: RoomManager) {
+async fn handle_socket(mut socket: WebSocket, app_state: AppState) {
+    let (notifications_tx, mut notifications_rx) = mpsc::unbounded_channel();
     let mut state = SessionState {
-        rooms,
+        rooms: app_state.rooms(),
+        meeting_sessions: app_state.meeting_sessions(),
+        notifications_tx,
         joined: None,
     };
 
-    while let Some(msg) = socket.recv().await {
-        let Ok(msg) = msg else {
-            break;
-        };
-
-        match msg {
-            Message::Text(text) => {
-                if let Some(resp) = handle_text(&mut state, text.to_string()).await {
-                    let Ok(serialized) = serde_json::to_string(&resp) else {
-                        break;
-                    };
-                    if socket.send(Message::Text(serialized.into())).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            Message::Ping(payload) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
+    loop {
+        tokio::select! {
+            maybe_notification = notifications_rx.recv() => {
+                let Some(notification) = maybe_notification else {
+                    break;
+                };
+                if handle_notification(&mut state, &mut socket, notification).await.is_err() {
                     break;
                 }
             }
-            Message::Close(_) => break,
-            Message::Binary(_) | Message::Pong(_) => {}
+            maybe_msg = socket.recv() => {
+                let Some(msg) = maybe_msg else {
+                    break;
+                };
+                let Ok(msg) = msg else {
+                    break;
+                };
+
+                match msg {
+                    Message::Text(text) => {
+                        if let Some(resp) = handle_text(&mut state, text.to_string()).await {
+                            let Ok(serialized) = serde_json::to_string(&resp) else {
+                                break;
+                            };
+                            if socket.send(Message::Text(serialized.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Binary(_) | Message::Pong(_) => {}
+                }
+            }
         }
     }
 
     cleanup_joined_session(&mut state).await;
 }
 
+async fn handle_notification(
+    state: &mut SessionState,
+    socket: &mut WebSocket,
+    notification: MeetingRenegotiationNotification,
+) -> Result<(), ()> {
+    let Some(joined) = state.joined.as_mut() else {
+        return Ok(());
+    };
+
+    joined.revision = notification.revision;
+    joined.negotiation = NegotiationState::RenegotiationRequired;
+    let room = joined.room.clone();
+    let participant_id = joined.participant_id.clone();
+    let negotiation = joined.negotiation;
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
+
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": "renegotiation_required",
+        "params": {
+            "revision": notification.revision,
+            "reason": notification.reason,
+            "negotiation_state": notification.negotiation_state.as_label(),
+        }
+    });
+    let serialized = serde_json::to_string(&payload).map_err(|_| ())?;
+    socket
+        .send(Message::Text(serialized.into()))
+        .await
+        .map_err(|_| ())
+}
+
+fn sync_registered_negotiation_state(
+    registry: &MeetingSessionRegistry,
+    room: &RoomId,
+    participant_id: &str,
+    negotiation: NegotiationState,
+) {
+    registry.set_negotiation_state(
+        room,
+        participant_id,
+        meeting_negotiation_state(negotiation),
+    );
+}
+
+fn notify_other_participants(
+    state: &SessionState,
+    room: &RoomId,
+    caller_participant_id: &str,
+    affected_participant_ids: Vec<String>,
+    revision: u64,
+    reason: &'static str,
+) {
+    let recipients = affected_participant_ids
+        .into_iter()
+        .filter(|participant_id| participant_id != caller_participant_id)
+        .collect::<Vec<_>>();
+    state
+        .meeting_sessions
+        .notify_participants(room, &recipients, revision, reason);
+}
+
+fn meeting_negotiation_state(state: NegotiationState) -> MeetingNegotiationState {
+    match state {
+        NegotiationState::AwaitingInitialOffer => MeetingNegotiationState::AwaitingInitialOffer,
+        NegotiationState::Stable => MeetingNegotiationState::Stable,
+        NegotiationState::RenegotiationRequired => MeetingNegotiationState::RenegotiationRequired,
+    }
+}
+
 async fn cleanup_joined_session(state: &mut SessionState) {
     if let Some(joined) = state.joined.take() {
-        if let Err(err) = state
+        state
+            .meeting_sessions
+            .unregister(&joined.room, &joined.participant_id);
+        match state
             .rooms
-            .meeting_leave(joined.room.clone(), &joined.participant_id)
+            .meeting_leave_with_outcome(joined.room.clone(), &joined.participant_id)
             .await
         {
-            warn!(
-                participant_id = %joined.participant_id,
-                room = %joined.room.0,
-                cause = TransportError::cause_label_from_anyhow(&err),
-                "meeting ws close cleanup failed: {err:#}"
-            );
-        } else {
-            info!(
-                participant_id = %joined.participant_id,
-                room = %joined.room.0,
-                "meeting ws connection closed; participant left session"
-            );
+            Ok(outcome) => {
+                notify_other_participants(
+                    state,
+                    &joined.room,
+                    &joined.participant_id,
+                    outcome.affected_participant_ids,
+                    outcome.revision,
+                    "participant_left",
+                );
+                info!(
+                    participant_id = %joined.participant_id,
+                    room = %joined.room.0,
+                    "meeting ws connection closed; participant left session"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    participant_id = %joined.participant_id,
+                    room = %joined.room.0,
+                    cause = TransportError::cause_label_from_anyhow(&err),
+                    "meeting ws close cleanup failed: {err:#}"
+                );
+            }
         }
     }
 }
@@ -339,6 +451,9 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
         revision,
         negotiation: NegotiationState::AwaitingInitialOffer,
     });
+    state
+        .meeting_sessions
+        .register(&room, &participant_id, state.notifications_tx.clone());
 
     info!(
         participant_id = %participant_id,
@@ -360,11 +475,22 @@ async fn leave(state: &mut SessionState) -> Result<Value, RpcError> {
         return Err(rpc_core_error(CoreError::NotJoined));
     };
 
-    state
+    let outcome = state
         .rooms
-        .meeting_leave(joined.room.clone(), &joined.participant_id)
+        .meeting_leave_with_outcome(joined.room.clone(), &joined.participant_id)
         .await
         .map_err(rpc_transport_error)?;
+    state
+        .meeting_sessions
+        .unregister(&joined.room, &joined.participant_id);
+    notify_other_participants(
+        state,
+        &joined.room,
+        &joined.participant_id,
+        outcome.affected_participant_ids,
+        outcome.revision,
+        "participant_left",
+    );
 
     info!(
         participant_id = %joined.participant_id,
@@ -420,6 +546,15 @@ async fn sdp_offer(state: &mut SessionState, params: Value) -> Result<Value, Rpc
 
     joined.revision = answer.revision;
     joined.negotiation = NegotiationState::Stable;
+    let room = joined.room.clone();
+    let participant_id = joined.participant_id.clone();
+    let negotiation = joined.negotiation;
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
 
     Ok(json!({
         "answer_sdp": answer.answer_sdp,
@@ -493,6 +628,15 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
         .meeting_publish_tracks(joined.room.clone(), &joined.participant_id, tracks)
         .map_err(rpc_transport_error)?;
     let needs_renegotiation = joined.note_revision_change(revision);
+    let room = joined.room.clone();
+    let participant_id = joined.participant_id.clone();
+    let negotiation = joined.negotiation;
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
 
     Ok(json!({
         "revision": revision,
@@ -502,10 +646,6 @@ async fn publish_tracks(state: &mut SessionState, params: Value) -> Result<Value
 }
 
 async fn unpublish_tracks(state: &mut SessionState, params: Value) -> Result<Value, RpcError> {
-    let joined = state
-        .joined
-        .as_mut()
-        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: TrackIdsParams = serde_json::from_value(params).map_err(|err| {
         rpc_error(
             -32602,
@@ -513,20 +653,48 @@ async fn unpublish_tracks(state: &mut SessionState, params: Value) -> Result<Val
         )
     })?;
 
-    let revision = state
-        .rooms
-        .meeting_unpublish_tracks(
+    let (room, participant_id, negotiation, needs_renegotiation, outcome_revision, affected_ids) = {
+        let joined = state
+            .joined
+            .as_mut()
+            .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
+        let outcome = state
+            .rooms
+            .meeting_unpublish_tracks_with_outcome(
+                joined.room.clone(),
+                &joined.participant_id,
+                params.track_ids,
+            )
+            .map_err(rpc_transport_error)?;
+        let needs_renegotiation = joined.note_revision_change(outcome.revision);
+        (
             joined.room.clone(),
-            &joined.participant_id,
-            params.track_ids,
+            joined.participant_id.clone(),
+            joined.negotiation,
+            needs_renegotiation,
+            outcome.revision,
+            outcome.affected_participant_ids,
         )
-        .map_err(rpc_transport_error)?;
-    let needs_renegotiation = joined.note_revision_change(revision);
+    };
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
+    notify_other_participants(
+        state,
+        &room,
+        &participant_id,
+        affected_ids,
+        outcome_revision,
+        "tracks_unpublished",
+    );
 
     Ok(json!({
-        "revision": revision,
+        "revision": outcome_revision,
         "needs_renegotiation": needs_renegotiation,
-        "negotiation_state": negotiation_state_label(joined.negotiation)
+        "negotiation_state": negotiation_state_label(negotiation)
     }))
 }
 
@@ -547,6 +715,15 @@ async fn subscribe(state: &mut SessionState, params: Value) -> Result<Value, Rpc
         )
         .map_err(rpc_transport_error)?;
     let needs_renegotiation = joined.note_revision_change(revision);
+    let room = joined.room.clone();
+    let participant_id = joined.participant_id.clone();
+    let negotiation = joined.negotiation;
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
 
     Ok(json!({
         "revision": revision,
@@ -572,6 +749,15 @@ async fn unsubscribe(state: &mut SessionState, params: Value) -> Result<Value, R
         )
         .map_err(rpc_transport_error)?;
     let needs_renegotiation = joined.note_revision_change(revision);
+    let room = joined.room.clone();
+    let participant_id = joined.participant_id.clone();
+    let negotiation = joined.negotiation;
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
 
     Ok(json!({
         "revision": revision,
@@ -705,25 +891,49 @@ async fn get_policy_mode(state: &mut SessionState) -> Result<Value, RpcError> {
 }
 
 async fn set_policy_mode(state: &mut SessionState, params: Value) -> Result<Value, RpcError> {
-    let joined = state
-        .joined
-        .as_mut()
-        .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
     let params: SetPolicyModeParams = serde_json::from_value(params)
         .map_err(|err| rpc_error(-32602, format!("invalid params for set_policy_mode: {err}")))?;
 
     let mode: MeetingPolicyMode = params.mode.into();
-    let revision = state
-        .rooms
-        .meeting_set_policy_mode(joined.room.clone(), mode)
-        .map_err(rpc_transport_error)?;
-    let needs_renegotiation = joined.note_revision_change(revision);
+    let (room, participant_id, negotiation, needs_renegotiation, outcome_revision, affected_ids) = {
+        let joined = state
+            .joined
+            .as_mut()
+            .ok_or_else(|| rpc_core_error(CoreError::NotJoined))?;
+        let outcome = state
+            .rooms
+            .meeting_set_policy_mode_with_outcome(joined.room.clone(), mode)
+            .map_err(rpc_transport_error)?;
+        let needs_renegotiation = joined.note_revision_change(outcome.revision);
+        (
+            joined.room.clone(),
+            joined.participant_id.clone(),
+            joined.negotiation,
+            needs_renegotiation,
+            outcome.revision,
+            outcome.affected_participant_ids,
+        )
+    };
+    sync_registered_negotiation_state(
+        &state.meeting_sessions,
+        &room,
+        &participant_id,
+        negotiation,
+    );
+    notify_other_participants(
+        state,
+        &room,
+        &participant_id,
+        affected_ids,
+        outcome_revision,
+        "policy_mode_changed",
+    );
 
     Ok(json!({
         "mode": policy_mode_label(mode),
-        "revision": revision,
+        "revision": outcome_revision,
         "needs_renegotiation": needs_renegotiation,
-        "negotiation_state": negotiation_state_label(joined.negotiation)
+        "negotiation_state": negotiation_state_label(negotiation)
     }))
 }
 
@@ -765,13 +975,25 @@ mod tests {
         join, leave, list_participants, list_subscriptions, publish_tracks, sdp_offer,
         set_policy_mode, subscribe, unsubscribe,
     };
+    use crate::MeetingSessionRegistry;
     use media::GstRuntime;
     use narwhal_core::{MediaKind, MeetingPublishTrack, RoomId, RoomManager};
     use serde_json::json;
+    use tokio::sync::mpsc;
 
     fn manager() -> RoomManager {
         let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
         RoomManager::new(gst)
+    }
+
+    fn session_state(rooms: RoomManager) -> SessionState {
+        let (notifications_tx, _notifications_rx) = mpsc::unbounded_channel();
+        SessionState {
+            rooms,
+            meeting_sessions: MeetingSessionRegistry::default(),
+            notifications_tx,
+            joined: None,
+        }
     }
 
     fn awaiting_participant(room: RoomId, participant_id: &str, revision: u64) -> JoinedParticipant {
@@ -839,14 +1061,12 @@ a=ssrc:5678 msid:test video0\r\n"
 
     #[tokio::test(flavor = "current_thread")]
     async fn join_rejects_when_session_already_joined() {
-        let mut state = SessionState {
-            rooms: manager(),
-            joined: Some(awaiting_participant(
-                RoomId("room-a".to_string()),
-                "participant-a",
-                1,
-            )),
-        };
+        let mut state = session_state(manager());
+        state.joined = Some(awaiting_participant(
+            RoomId("room-a".to_string()),
+            "participant-a",
+            1,
+        ));
 
         let err = join(
             &mut state,
@@ -864,10 +1084,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
     #[tokio::test(flavor = "current_thread")]
     async fn leave_requires_joined_session() {
-        let mut state = SessionState {
-            rooms: manager(),
-            joined: None,
-        };
+        let mut state = session_state(manager());
 
         let err = leave(&mut state).await.expect_err("leave should fail");
         assert_eq!(err.code, 4220);
@@ -876,10 +1093,7 @@ a=ssrc:5678 msid:test video0\r\n"
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_text_maps_not_joined_rpc_error() {
-        let mut state = SessionState {
-            rooms: manager(),
-            joined: None,
-        };
+        let mut state = session_state(manager());
 
         let response = handle_text(
             &mut state,
@@ -910,10 +1124,8 @@ a=ssrc:5678 msid:test video0\r\n"
             .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
             .expect("bob joins");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room.clone(), "alice", alice_revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room.clone(), "alice", alice_revision));
 
         let publish_result = publish_tracks(
             &mut state,
@@ -968,10 +1180,8 @@ a=ssrc:5678 msid:test video0\r\n"
             .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
             .expect("alice joins");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room, "alice", revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room, "alice", revision));
 
         let err = sdp_offer(
             &mut state,
@@ -995,10 +1205,8 @@ a=ssrc:5678 msid:test video0\r\n"
             .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
             .expect("alice joins");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room, "alice", revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room, "alice", revision));
 
         let result = sdp_offer(
             &mut state,
@@ -1050,10 +1258,8 @@ a=ssrc:5678 msid:test video0\r\n"
             .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
             .expect("bob joins");
 
-        let mut bob_state = SessionState {
-            rooms: rooms.clone(),
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut bob_state = session_state(rooms.clone());
+        bob_state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         sdp_offer(
             &mut bob_state,
@@ -1133,10 +1339,8 @@ a=ssrc:5678 msid:test video0\r\n"
             .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
             .expect("bob joins");
 
-        let mut bob_state = SessionState {
-            rooms: rooms.clone(),
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut bob_state = session_state(rooms.clone());
+        bob_state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         let initial = sdp_offer(
             &mut bob_state,
@@ -1245,10 +1449,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes");
 
-        let mut bob_state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room, "bob", bob_revision)),
-        };
+        let mut bob_state = session_state(rooms);
+        bob_state.joined = Some(awaiting_participant(room, "bob", bob_revision));
 
         let subscribe_result = subscribe(
             &mut bob_state,
@@ -1322,10 +1524,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes");
 
-        let mut bob_state = SessionState {
-            rooms: rooms.clone(),
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut bob_state = session_state(rooms.clone());
+        bob_state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         let first_subscribe = subscribe(
             &mut bob_state,
@@ -1428,10 +1628,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         let subscribe_result = subscribe(
             &mut state,
@@ -1523,10 +1721,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room, "bob", bob_revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room, "bob", bob_revision));
 
         let first_subscribe = subscribe(
             &mut state,
@@ -1601,10 +1797,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         sdp_offer(
             &mut state,
@@ -1663,12 +1857,10 @@ a=ssrc:5678 msid:test video0\r\n"
     async fn ws_close_cleanup_removes_participant_and_allows_reconnect() {
         let rooms = manager();
         let room = RoomId("meeting-reconnect".to_string());
+        let mut join_state = session_state(rooms.clone());
 
         let first_join = join(
-            &mut SessionState {
-                rooms: rooms.clone(),
-                joined: None,
-            },
+            &mut join_state,
             json!({
                 "room": room.0,
                 "display_name": "Alice"
@@ -1683,14 +1875,12 @@ a=ssrc:5678 msid:test video0\r\n"
             .to_string();
         let first_revision = first_join["revision"].as_u64().expect("revision present");
 
-        let mut first_state = SessionState {
-            rooms: rooms.clone(),
-            joined: Some(awaiting_participant(
-                room.clone(),
-                &first_participant_id,
-                first_revision,
-            )),
-        };
+        let mut first_state = session_state(rooms.clone());
+        first_state.joined = Some(awaiting_participant(
+            room.clone(),
+            &first_participant_id,
+            first_revision,
+        ));
 
         let before_cleanup = list_participants(&mut first_state)
             .await
@@ -1703,10 +1893,7 @@ a=ssrc:5678 msid:test video0\r\n"
         cleanup_joined_session(&mut first_state).await;
         assert!(first_state.joined.is_none());
 
-        let mut second_state = SessionState {
-            rooms,
-            joined: None,
-        };
+        let mut second_state = session_state(rooms);
         let second_join = join(
             &mut second_state,
             json!({
@@ -1762,10 +1949,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes");
 
-        let mut bob_state = SessionState {
-            rooms: rooms.clone(),
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut bob_state = session_state(rooms.clone());
+        bob_state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         subscribe(
             &mut bob_state,
@@ -1824,10 +2009,8 @@ a=ssrc:5678 msid:test video0\r\n"
             )
             .expect("alice publishes first track");
 
-        let mut bob_state = SessionState {
-            rooms: rooms.clone(),
-            joined: Some(awaiting_participant(room.clone(), "bob", bob_revision)),
-        };
+        let mut bob_state = session_state(rooms.clone());
+        bob_state.joined = Some(awaiting_participant(room.clone(), "bob", bob_revision));
 
         let first_subscribe = subscribe(
             &mut bob_state,
@@ -1903,10 +2086,8 @@ a=ssrc:5678 msid:test video0\r\n"
             .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
             .expect("alice joins");
 
-        let mut state = SessionState {
-            rooms,
-            joined: Some(awaiting_participant(room, "alice", revision)),
-        };
+        let mut state = session_state(rooms);
+        state.joined = Some(awaiting_participant(room, "alice", revision));
 
         sdp_offer(
             &mut state,

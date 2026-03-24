@@ -38,6 +38,16 @@ pub struct MeetingSdpResponse {
     pub revision: u64,
 }
 
+pub struct MeetingMutationOutcome {
+    pub revision: u64,
+    pub affected_participant_ids: Vec<String>,
+}
+
+pub struct MeetingLeaveOutcome {
+    pub revision: u64,
+    pub affected_participant_ids: Vec<String>,
+}
+
 pub struct MeetingPublishTrack {
     pub track_id: String,
     pub media_kind: crate::MediaKind,
@@ -396,13 +406,59 @@ impl RoomManager {
         room: RoomId,
         policy_mode: MeetingPolicyMode,
     ) -> Result<u64> {
+        self.meeting_set_policy_mode_with_outcome(room, policy_mode)
+            .map(|outcome| outcome.revision)
+    }
+
+    pub fn meeting_set_policy_mode_with_outcome(
+        &self,
+        room: RoomId,
+        policy_mode: MeetingPolicyMode,
+    ) -> Result<MeetingMutationOutcome> {
         let mut g = self.inner.write();
         let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
+        let previous_effective = rs
+            .meeting_plan
+            .per_subscriber
+            .keys()
+            .map(|participant_id| {
+                (
+                    participant_id.0.clone(),
+                    rs.meeting_plan
+                        .effective_track_ids_for(participant_id)
+                        .into_iter()
+                        .map(|track_id| track_id.0)
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         rs.meeting.policy_mode = policy_mode;
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
-        Ok(revision)
+        let mut affected_participant_ids = rs
+            .meeting
+            .participants
+            .keys()
+            .filter_map(|participant_id| {
+                let current_effective = rs
+                    .meeting_plan
+                    .effective_track_ids_for(participant_id)
+                    .into_iter()
+                    .map(|track_id| track_id.0)
+                    .collect::<HashSet<_>>();
+                let before = previous_effective
+                    .get(&participant_id.0)
+                    .cloned()
+                    .unwrap_or_default();
+                (before != current_effective).then(|| participant_id.0.clone())
+            })
+            .collect::<Vec<_>>();
+        affected_participant_ids.sort();
+        Ok(MeetingMutationOutcome {
+            revision,
+            affected_participant_ids,
+        })
     }
 
     fn require_broadcast_mode(rs: &RoomState) -> Result<()> {
@@ -497,6 +553,16 @@ impl RoomManager {
         participant_id: &str,
         track_ids: Vec<String>,
     ) -> Result<u64> {
+        self.meeting_unpublish_tracks_with_outcome(room, participant_id, track_ids)
+            .map(|outcome| outcome.revision)
+    }
+
+    pub fn meeting_unpublish_tracks_with_outcome(
+        &self,
+        room: RoomId,
+        participant_id: &str,
+        track_ids: Vec<String>,
+    ) -> Result<MeetingMutationOutcome> {
         let mut g = self.inner.write();
         let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
         Self::require_meeting_mode(rs)?;
@@ -507,11 +573,17 @@ impl RoomManager {
         }
 
         let track_count = track_ids.len() as u64;
+        let mut affected_participant_ids = HashSet::new();
         for raw_id in track_ids {
             let tid = crate::TrackId(raw_id);
             if let Some(publi) = rs.meeting.publications.get(&tid) {
                 if publi.publisher != pid {
                     return Err(cannot_unpublish_track_not_owned());
+                }
+            }
+            for (subscriber_id, subscriptions) in &rs.meeting.subscription_requests {
+                if subscriptions.contains(&tid) {
+                    affected_participant_ids.insert(subscriber_id.0.clone());
                 }
             }
             rs.meeting.publications.remove(&tid);
@@ -524,7 +596,12 @@ impl RoomManager {
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
         self.metrics.add_meeting_unpublish_tracks(track_count);
-        Ok(revision)
+        let mut affected_participant_ids = affected_participant_ids.into_iter().collect::<Vec<_>>();
+        affected_participant_ids.sort();
+        Ok(MeetingMutationOutcome {
+            revision,
+            affected_participant_ids,
+        })
     }
 
     pub fn meeting_subscribe(
@@ -820,29 +897,66 @@ impl RoomManager {
     }
 
     pub async fn meeting_leave(&self, room: RoomId, participant_id: &str) -> Result<()> {
-        let participant = {
+        self.meeting_leave_with_outcome(room, participant_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn meeting_leave_with_outcome(
+        &self,
+        room: RoomId,
+        participant_id: &str,
+    ) -> Result<MeetingLeaveOutcome> {
+        let (participant, affected_participant_ids, revision) = {
             let mut g = self.inner.write();
             let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
+            let pid = ParticipantId(participant_id.to_string());
             if !rs
                 .meeting
                 .participants
-                .contains_key(&ParticipantId(participant_id.to_string()))
+                .contains_key(&pid)
             {
-                return Ok(());
+                return Ok(MeetingLeaveOutcome {
+                    revision: rs.meeting.revision,
+                    affected_participant_ids: Vec::new(),
+                });
             }
+            let published_track_ids = rs
+                .meeting
+                .publications
+                .iter()
+                .filter_map(|(track_id, publication)| {
+                    (publication.publisher == pid).then(|| track_id.clone())
+                })
+                .collect::<Vec<_>>();
+            let mut affected_participant_ids = rs
+                .meeting
+                .subscription_requests
+                .iter()
+                .filter_map(|(subscriber_id, subscriptions)| {
+                    published_track_ids
+                        .iter()
+                        .any(|track_id| subscriptions.contains(track_id))
+                        .then(|| subscriber_id.0.clone())
+                })
+                .collect::<Vec<_>>();
+            affected_participant_ids.sort();
             let participant = Self::remove_meeting_participant_state(rs, participant_id)
                 .map_err(|_| meeting_participant_session_not_found())?;
-            rs.meeting.next_revision();
+            let revision = rs.meeting.next_revision();
             Self::recompute_meeting_plan(rs);
-            participant
+            (participant, affected_participant_ids, revision)
         };
 
         if let Some(participant) = participant {
             participant.peer.stop().await?;
         }
         self.metrics.inc_meeting_leaves();
-        Ok(())
+        Ok(MeetingLeaveOutcome {
+            revision,
+            affected_participant_ids,
+        })
     }
 
     pub async fn meeting_sdp_offer(
