@@ -466,6 +466,7 @@ Current behavior:
 - the participant must have joined first
 - the server creates the underlying media peer lazily on first SDP offer
 - revisions greater than the current room revision are rejected
+- if the room revision advances while an SDP answer is being generated, the offer is rejected with a conflict-style error and the client must retry `sdp_offer` against the newer revision instead of applying a stale answer
 
 #### `trickle_ice`
 
@@ -729,19 +730,18 @@ Current behavior:
 - `join` returns the current revision after participant insertion
 - mutating operations such as publish, unpublish, subscribe, unsubscribe, and policy changes increment the revision
 - `sdp_offer` rejects revisions greater than the current room revision
+- `sdp_offer` also rejects answers superseded by a newer room revision observed before negotiation completes
 - when a publisher leaves, their publications are removed and other participants' requested/effective subscriptions are pruned accordingly
 - if that publisher rejoins later, they are a new session and remote participants must subscribe again to the newly published track IDs
 
 Current limitation:
 
-- the API now returns `revision`, `needs_renegotiation`, and a session-local `negotiation_state`, but renegotiation is still not fully modeled server-wide
-- `needs_renegotiation` and `negotiation_state` currently reflect the caller's own session state only
+- the API now returns `revision`, `needs_renegotiation`, and a session-local `negotiation_state`, and also emits server-push `renegotiation_required` notifications for some room-wide changes
 - clients should treat revision as authoritative room state versioning, but not as a finished renegotiation protocol for every participant in the room
 
 ## Current Limitations
 
-- there is no server-push event stream for room changes; clients poll via RPC methods
 - ICE is drained by explicit client polling
-- meeting renegotiation semantics are session-local and still incomplete at the room-wide orchestration level
+- meeting renegotiation semantics are more explicit now, but still incomplete at the room-wide orchestration level for cases like ICE restart and broader browser recovery flows
 - broadcast subscribe currently requires the publisher to already be flowing RTP
 - status codes and JSON-RPC error codes are stable enough for current tests, but the protocol should still be considered evolving

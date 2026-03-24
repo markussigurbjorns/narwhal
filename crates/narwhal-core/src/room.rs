@@ -975,7 +975,7 @@ impl RoomManager {
         let _entered = span.enter();
         self.metrics.inc_meeting_sdp_offers();
         let result: Result<MeetingSdpResponse> = async {
-            let need_create = {
+            let (need_create, negotiation_revision) = {
                 let g = self.inner.read();
                 let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
                 Self::require_meeting_mode(rs)?;
@@ -986,7 +986,10 @@ impl RoomManager {
                 if revision > rs.meeting.revision {
                     return Err(invalid_future_revision(revision, rs.meeting.revision));
                 }
-                !rs.meeting_participants.contains_key(participant_id)
+                (
+                    !rs.meeting_participants.contains_key(participant_id),
+                    rs.meeting.revision,
+                )
             };
 
             if need_create {
@@ -1096,6 +1099,9 @@ impl RoomManager {
             let g = self.inner.read();
             let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
             Self::require_meeting_mode(rs)?;
+            if rs.meeting.revision != negotiation_revision {
+                return Err(negotiation_superseded(revision, rs.meeting.revision));
+            }
 
             Ok(MeetingSdpResponse {
                 answer_sdp,
@@ -2078,6 +2084,10 @@ fn meeting_signaling_unavailable_in_broadcast_mode() -> anyhow::Error {
 
 fn invalid_future_revision(got: u64, current: u64) -> anyhow::Error {
     Error::InvalidFutureRevision { got, current }.into()
+}
+
+fn negotiation_superseded(offered: u64, current: u64) -> anyhow::Error {
+    Error::NegotiationSuperseded { offered, current }.into()
 }
 
 fn publisher_not_flowing() -> anyhow::Error {

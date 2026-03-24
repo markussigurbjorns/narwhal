@@ -149,8 +149,8 @@
 
   Work:
 
-  - serialize renegotiation per peer
-  - make room-wide/server-driven renegotiation explicit
+  ~ serialize renegotiation per peer by rejecting SDP answers superseded during negotiation
+  ~ make room-wide/server-driven renegotiation explicit
   - finish ICE restart handling
   - validate MID/RID/SSRC routing under simulcast
   ✓ ensure subscription changes become effective without desync

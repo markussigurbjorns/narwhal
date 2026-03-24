@@ -38,6 +38,8 @@ pub enum Error {
     MeetingSignalingUnavailableInBroadcastMode,
     #[error("invalid future revision: got {got}, current {current}")]
     InvalidFutureRevision { got: u64, current: u64 },
+    #[error("room revision advanced during negotiation: offered {offered}, current {current}; retry sdp_offer")]
+    NegotiationSuperseded { offered: u64, current: u64 },
     #[error("publisher has not produced RTP yet; try subscribing after media is flowing")]
     PublisherNotFlowing,
     #[error("whep injector was not created during negotiation")]
@@ -58,7 +60,8 @@ impl Error {
             Error::PublisherIdMismatch
             | Error::RoomAlreadyActiveInBroadcastMode
             | Error::BroadcastEndpointsUnavailableInMeetingMode
-            | Error::MeetingSignalingUnavailableInBroadcastMode => ErrorCategory::Conflict,
+            | Error::MeetingSignalingUnavailableInBroadcastMode
+            | Error::NegotiationSuperseded { .. } => ErrorCategory::Conflict,
             Error::NotJoined
             | Error::UnknownTrackRequested
             | Error::CannotUnpublishTrackNotOwned
@@ -87,6 +90,7 @@ impl Error {
             Error::BroadcastEndpointsUnavailableInMeetingMode
             | Error::MeetingSignalingUnavailableInBroadcastMode => "room_mode_conflict",
             Error::InvalidFutureRevision { .. } => "stale_or_future_revision",
+            Error::NegotiationSuperseded { .. } => "negotiation_superseded",
             Error::PublisherNotFlowing => "publisher_not_flowing",
             Error::WhepInjectorNotCreated => "injector_missing",
             Error::Internal(_) => "internal",
@@ -107,6 +111,14 @@ mod tests {
             Error::InvalidFutureRevision { got: 3, current: 2 }.category(),
             ErrorCategory::InvalidRequest
         );
+        assert_eq!(
+            Error::NegotiationSuperseded {
+                offered: 2,
+                current: 3
+            }
+            .category(),
+            ErrorCategory::Conflict
+        );
     }
 
     #[test]
@@ -114,6 +126,14 @@ mod tests {
         assert_eq!(Error::RoomNotFound.cause_label(), "room_not_found");
         assert_eq!(Error::AlreadyJoined.cause_label(), "already_joined");
         assert_eq!(Error::NotJoined.cause_label(), "not_joined");
+        assert_eq!(
+            Error::NegotiationSuperseded {
+                offered: 2,
+                current: 3
+            }
+            .cause_label(),
+            "negotiation_superseded"
+        );
         assert_eq!(
             Error::MeetingSignalingUnavailableInBroadcastMode.cause_label(),
             "room_mode_conflict"
