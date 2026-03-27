@@ -215,6 +215,17 @@ Warning logs for negotiation and room/media failures should carry the same stabl
 
 This keeps metrics, HTTP/JSON-RPC transport behavior, and tracing output aligned on one taxonomy.
 
+Current structured tracing fields now commonly include:
+
+- `room`
+- `participant_id` or `subscriber_id`
+- `peer_id`
+- `track_id`
+- `revision`
+- `cause`
+
+That field set is intentionally repetitive across server, core, and media logs so a stalled subscriber or failed negotiation can be followed across layers without re-mapping identifiers.
+
 ## Current Gaps
 
 The current metrics do not yet include:
@@ -227,3 +238,30 @@ The current metrics do not yet include:
 - active speaker or subscription distribution metrics
 
 Those should be added only if they remain low-cardinality and operationally actionable.
+
+## Periodic Debug Snapshots
+
+For ad hoc debugging, `narwhald` can emit periodic room snapshots to the log when:
+
+- `NARWHAL_DEBUG_ROOM_SNAPSHOT_SECS` is set to a value greater than `0`
+
+Each snapshot currently includes:
+
+- `room`
+- `mode`
+- `broadcast_policy_mode`
+- `meeting_policy_mode`
+- `meeting_revision`
+- `broadcast_publisher_active`
+- `broadcast_subscribers`
+- `broadcast_streams`
+- `meeting_participants`
+- `meeting_publications`
+- `meeting_streams`
+
+This is intentionally lightweight and process-local. It is meant to help answer questions like:
+
+- does the server still think the room is active?
+- did a subscriber disappear due to eviction or teardown?
+- are publications present but streams not yet observed?
+- is a meeting room revision advancing while media state remains empty?

@@ -90,9 +90,9 @@
   Work:
 
   ✓ add metrics crate and exporter endpoint
-  ~ add structured tracing fields: room id, participant id, peer id, track id
+  ✓ add structured tracing fields: room id, participant id, peer id, track id
   ~ emit lifecycle spans around negotiation and forwarding
-  - add lightweight periodic state snapshots for debugging
+  ✓ add lightweight periodic state snapshots for debugging
 
   Deliverables:
 

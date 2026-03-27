@@ -458,6 +458,8 @@ async fn join(state: &mut SessionState, params: Value) -> Result<Value, RpcError
     info!(
         participant_id = %participant_id,
         room = %room.0,
+        revision,
+        negotiation_state = NegotiationState::AwaitingInitialOffer.as_label(),
         "participant joined meeting ws session"
     );
 
@@ -495,6 +497,7 @@ async fn leave(state: &mut SessionState) -> Result<Value, RpcError> {
     info!(
         participant_id = %joined.participant_id,
         room = %joined.room.0,
+        revision = outcome.revision,
         "participant left meeting ws session"
     );
 

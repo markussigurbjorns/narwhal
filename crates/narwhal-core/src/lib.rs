@@ -30,7 +30,7 @@ pub use room::{
     BroadcastGraphEdgeInfo, BroadcastInspection, BroadcastStreamInfo, BroadcastSubscriberPlanInfo,
     BroadcastVideoSelectionInfo, MeetingParticipantInfo, MeetingPublicationInfo,
     MeetingSdpOfferTestHook,
-    MeetingPublishTrack, MeetingSdpResponse, MeetingStreamInfo, RoomId, RoomManager,
+    MeetingPublishTrack, MeetingSdpResponse, MeetingStreamInfo, RoomDebugSnapshot, RoomId, RoomManager,
     RoomManagerConfig, SdpResponse,
 };
 pub use session::{MeetingParticipantSession, MidRoutingInfo, PublisherSession, SubscriberSession};

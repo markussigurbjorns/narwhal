@@ -16,6 +16,11 @@ This document defines the settings that affect current server behavior.
   - Default: `10`
   - Controls how long `narwhald` stays in drain mode after receiving shutdown before active peers are stopped.
 
+- `NARWHAL_DEBUG_ROOM_SNAPSHOT_SECS`
+  - Type: `u64`
+  - Default: `0` (disabled)
+  - When greater than `0`, `narwhald` logs a compact per-room debug snapshot at that interval.
+
 What it means:
 
 - forwarded RTP is written into a bounded per-subscriber injector queue
@@ -32,6 +37,7 @@ This is a per-subscriber backpressure threshold, not a global room capacity sett
 
 At startup, `narwhald` logs the effective value it loaded for this threshold. That log line is the current source of truth for what policy a node is actually running with.
 It also logs the effective shutdown drain window.
+If enabled, it also logs the effective room snapshot interval.
 
 ## Health Endpoints
 

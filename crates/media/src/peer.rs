@@ -445,7 +445,8 @@ impl PeerSession {
                                 let peer_id = keyframe_peer_id.clone();
                                 Arc::new(move || {
                                     tracing::info!(
-                                        "[{peer_id}] subscriber requested a video keyframe"
+                                        peer_id = %peer_id,
+                                        "subscriber requested a video keyframe"
                                     );
                                     events.on_keyframe_request(&peer_id);
                                 }) as Arc<dyn Fn() + Send + Sync>
@@ -548,6 +549,8 @@ impl PeerSession {
                                     );
                                     tracing::debug!(
                                         peer_id = %peer_id_for_answer,
+                                        role = ?role_for_answer,
+                                        preserve_transport_identity,
                                         raw_answer_sdp = %txt,
                                         "raw meeting answer SDP from webrtcbin"
                                     );
@@ -646,7 +649,12 @@ impl PeerSession {
                     if let Some(ev) = &events {
                         ev.on_ice_candidate(&peer_id, evt);
                     } else {
-                        tracing::debug!("[{peer_id}] ICE cand mline={mlineindex} cand={cand}");
+                        tracing::debug!(
+                            peer_id = %peer_id,
+                            mline_index = mlineindex,
+                            candidate = %cand,
+                            "local ICE candidate gathered"
+                        );
                     }
                     None
                 });
@@ -680,9 +688,11 @@ impl PeerSession {
                                 .map(|s| s.path_string())
                                 .unwrap_or_else(|| "<unknown>".into());
                             tracing::error!(
-                                "[{peer_id}] GST ERROR from {src}: {} (debug: {:?})",
-                                e.error(),
-                                e.debug()
+                                peer_id = %peer_id,
+                                source = %src,
+                                error = %e.error(),
+                                debug = ?e.debug(),
+                                "gstreamer pipeline error"
                             );
                             if let Some(ev) = &events {
                                 ev.on_state(&peer_id, PeerState::Failed);
@@ -696,9 +706,11 @@ impl PeerSession {
                                 .map(|s| s.path_string())
                                 .unwrap_or_else(|| "<unknown>".into());
                             tracing::warn!(
-                                "[{peer_id}] GST WARNING from {src}: {} (debug: {:?})",
-                                w.error(),
-                                w.debug()
+                                peer_id = %peer_id,
+                                source = %src,
+                                error = %w.error(),
+                                debug = ?w.debug(),
+                                "gstreamer pipeline warning"
                             );
                             ControlFlow::Continue
                         }
@@ -710,10 +722,11 @@ impl PeerSession {
                                 .is_some_and(|o| *o == pipeline.upcast_ref::<gst::Object>())
                             {
                                 tracing::info!(
-                                    "[{peer_id}] pipeline state: {:?} -> {:?} (pending {:?})",
-                                    s.old(),
-                                    s.current(),
-                                    s.pending()
+                                    peer_id = %peer_id,
+                                    old_state = ?s.old(),
+                                    current_state = ?s.current(),
+                                    pending_state = ?s.pending(),
+                                    "pipeline state changed"
                                 );
                             }
                             ControlFlow::Continue

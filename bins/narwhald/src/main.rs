@@ -19,13 +19,22 @@ async fn main() -> Result<()> {
     let gst = GstRuntime::init()?;
     let room_manager_config = room_manager_config()?;
     let shutdown_drain_secs = parse_env_u64("NARWHAL_SHUTDOWN_DRAIN_SECS", 10)?;
+    let debug_snapshot_secs = parse_env_u64("NARWHAL_DEBUG_ROOM_SNAPSHOT_SECS", 0)?;
     tracing::info!(
         slow_subscriber_drop_streak_limit = room_manager_config.slow_subscriber_drop_streak_limit,
         shutdown_drain_secs,
+        debug_room_snapshot_secs = debug_snapshot_secs,
         "loaded room manager config"
     );
     let rooms = RoomManager::with_config(gst, room_manager_config);
     let state = AppState::new(rooms);
+
+    if debug_snapshot_secs > 0 {
+        tokio::spawn(periodic_room_snapshot_logger(
+            state.rooms(),
+            Duration::from_secs(debug_snapshot_secs),
+        ));
+    }
 
     let app = server::app_with_state(state.clone()).merge(clients_routes());
 
@@ -82,6 +91,33 @@ async fn shutdown_signal(state: AppState, drain_duration: Duration) {
     sleep(drain_duration).await;
     tracing::info!("drain window elapsed; stopping active peers");
     state.rooms().shutdown().await;
+}
+
+async fn periodic_room_snapshot_logger(rooms: RoomManager, interval: Duration) {
+    loop {
+        sleep(interval).await;
+        let snapshots = rooms.debug_room_snapshots();
+        tracing::info!(
+            room_count = snapshots.len(),
+            "periodic room snapshot"
+        );
+        for snapshot in snapshots {
+            tracing::info!(
+                room = %snapshot.room_id,
+                mode = ?snapshot.mode,
+                broadcast_policy_mode = ?snapshot.broadcast_policy_mode,
+                meeting_policy_mode = ?snapshot.meeting_policy_mode,
+                meeting_revision = snapshot.meeting_revision,
+                broadcast_publisher_active = snapshot.broadcast_publisher_active,
+                broadcast_subscribers = snapshot.broadcast_subscribers,
+                broadcast_streams = snapshot.broadcast_streams,
+                meeting_participants = snapshot.meeting_participants,
+                meeting_publications = snapshot.meeting_publications,
+                meeting_streams = snapshot.meeting_streams,
+                "room snapshot"
+            );
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() {

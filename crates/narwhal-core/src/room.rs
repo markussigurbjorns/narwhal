@@ -100,6 +100,20 @@ pub struct BroadcastGraphEdgeInfo {
     pub video_target: Option<crate::VideoTarget>,
 }
 
+pub struct RoomDebugSnapshot {
+    pub room_id: String,
+    pub mode: RoomMode,
+    pub broadcast_policy_mode: BroadcastPolicyMode,
+    pub meeting_policy_mode: MeetingPolicyMode,
+    pub meeting_revision: u64,
+    pub broadcast_publisher_active: bool,
+    pub broadcast_subscribers: usize,
+    pub broadcast_streams: usize,
+    pub meeting_participants: usize,
+    pub meeting_publications: usize,
+    pub meeting_streams: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct MeetingStreamInfo {
     pub track_id: String,
@@ -221,8 +235,13 @@ impl PeerEvents for RoomPeerEvents {
         let rooms = self.rooms.clone();
         let room = self.room.clone();
         self.tokio_handle.spawn(async move {
+            let room_label = room.0.clone();
             if let Err(err) = rooms.request_publisher_keyframe(room).await {
-                tracing::warn!("failed to service subscriber keyframe request: {err:#}");
+                tracing::warn!(
+                    room = %room_label,
+                    cause = classify_negotiation_error(&err),
+                    "failed to service subscriber keyframe request: {err:#}"
+                );
             }
         });
     }
@@ -251,6 +270,33 @@ impl RoomManager {
 
     pub fn render_metrics(&self) -> String {
         self.metrics.render_prometheus(self.state_snapshot())
+    }
+
+    pub fn debug_room_snapshots(&self) -> Vec<RoomDebugSnapshot> {
+        let g = self.inner.read();
+        let mut snapshots = g
+            .rooms
+            .iter()
+            .map(|(room_id, room)| RoomDebugSnapshot {
+                room_id: room_id.0.clone(),
+                mode: room.mode,
+                broadcast_policy_mode: room.broadcast_policy_mode,
+                meeting_policy_mode: room.meeting.policy_mode,
+                meeting_revision: room.meeting.revision,
+                broadcast_publisher_active: room.publisher.is_some(),
+                broadcast_subscribers: room.subscribers.len(),
+                broadcast_streams: room.broadcast_streams.len(),
+                meeting_participants: room.meeting.participants.len(),
+                meeting_publications: room.meeting.publications.len(),
+                meeting_streams: room
+                    .meeting_streams
+                    .values()
+                    .map(std::collections::HashMap::len)
+                    .sum(),
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|a, b| a.room_id.cmp(&b.room_id));
+        snapshots
     }
 
     pub async fn probe_media_ready(&self) -> Result<()> {
@@ -1343,6 +1389,7 @@ impl RoomManager {
         }
 
         for (participant_id, reason, session) in evicted {
+            let room_label = room.0.clone();
             self.metrics
                 .inc_subscriber_evictions("meeting", reason.as_label());
             self.metrics.inc_meeting_leaves();
@@ -1357,6 +1404,7 @@ impl RoomManager {
                 if let Err(err) = session.peer.stop().await {
                     tracing::warn!(
                         participant_id = %participant_id,
+                        room = %room_label,
                         cause = reason.as_label(),
                         "failed to stop evicted meeting participant peer: {err:#}"
                     );
@@ -1422,6 +1470,7 @@ impl RoomManager {
         }
 
         for (subscriber_id, reason, session) in evicted {
+            let room_label = room.0.clone();
             self.metrics
                 .inc_subscriber_evictions("broadcast", reason.as_label());
             self.metrics.inc_broadcast_subscribers_stopped();
@@ -1436,6 +1485,7 @@ impl RoomManager {
                 if let Err(err) = session.peer.stop().await {
                     tracing::warn!(
                         subscriber_id = %subscriber_id,
+                        room = %room_label,
                         cause = reason.as_label(),
                         "failed to stop evicted broadcast subscriber peer: {err:#}"
                     );
@@ -1480,6 +1530,7 @@ impl RoomManager {
                 let key = format!("no-track:{publisher_id}:{kind:?}");
                 if rs.meeting_route_log_once.insert(key) {
                     tracing::info!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
                         media_kind = ?kind,
                         "meeting RTP arrived but no published track matched this publisher+kind"
@@ -1519,11 +1570,15 @@ impl RoomManager {
                 entry.entry(ssrc).or_insert_with(|| {
                     let encoding_id = rid.clone().unwrap_or_else(|| format!("ssrc:{ssrc}"));
                     tracing::info!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
                         track_id = %track_id_for_log,
                         media_kind = ?media_kind,
                         ssrc,
                         encoding_id = %encoding_id,
+                        mid = mapped_mid.as_deref().unwrap_or(""),
+                        rid = rid.as_deref().unwrap_or(""),
+                        spatial_layer = spatial_layer.unwrap_or(u8::MAX),
                         "observed meeting RTP stream"
                     );
                     MeetingStreamInfo {
@@ -1599,6 +1654,7 @@ impl RoomManager {
                 let key = format!("no-target:{publisher_id}:{kind:?}:{}", track_id.0);
                 if rs.meeting_route_log_once.insert(key) {
                     tracing::info!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
                         track_id = %track_id.0,
                         media_kind = ?kind,
@@ -1613,6 +1669,7 @@ impl RoomManager {
                     );
                     if rs.meeting_route_log_once.insert(key) {
                         tracing::info!(
+                            room = %room.0,
                             publisher_id = %publisher_id,
                             subscriber_id = %participant_id,
                             track_id = %track_id.0,
@@ -1635,9 +1692,11 @@ impl RoomManager {
                 Err(TrySendError::Full(_)) => {
                     self.metrics.inc_meeting_rtp_dropped("queue_full");
                     tracing::warn!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
                         subscriber_id = %participant_id,
                         track_id = %track_id.0,
+                        media_kind = ?kind,
                         "dropping meeting RTP packet because subscriber injector queue is full"
                     );
                     full_ids.push(participant_id);
@@ -1645,9 +1704,11 @@ impl RoomManager {
                 Err(TrySendError::Closed(_)) => {
                     self.metrics.inc_meeting_rtp_dropped("channel_closed");
                     tracing::debug!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
                         subscriber_id = %participant_id,
                         track_id = %track_id.0,
+                        media_kind = ?kind,
                         "meeting subscriber injector channel closed"
                     );
                     closed_ids.push(participant_id);
@@ -1674,6 +1735,7 @@ impl RoomManager {
                     );
                 } else {
                     tracing::info!(
+                        room = %room.0,
                         publisher_id = %publisher_id,
                         attempt,
                         "meeting keyframe warmup requested"
@@ -1744,12 +1806,20 @@ impl RoomManager {
                             room = %room.0,
                             stream = %stream_key,
                             subscriber_id = %subscriber_id,
+                            media_kind = ?kind,
                             "dropping broadcast RTP packet because subscriber injector queue is full"
                         );
                         full_ids.push(subscriber_id);
                     }
                     TrySendError::Closed(_) => {
                         self.metrics.inc_broadcast_rtp_dropped("channel_closed");
+                        tracing::debug!(
+                            room = %room.0,
+                            stream = %stream_key,
+                            subscriber_id = %subscriber_id,
+                            media_kind = ?kind,
+                            "broadcast subscriber injector channel closed"
+                        );
                         closed_ids.push(subscriber_id);
                     }
                 }
@@ -2150,8 +2220,10 @@ impl RoomManager {
         peer.play().await?;
         ice.clear();
 
+        let room_label = room.0.clone();
         if let Err(err) = self.request_publisher_keyframe(room).await {
             tracing::warn!(
+                room = %room_label,
                 subscriber_id = %sub_id,
                 cause = classify_negotiation_error(&err),
                 "failed to request keyframe after WHEP renegotiation: {err:#}"
@@ -3606,6 +3678,64 @@ a=ssrc:1234 msid:test audio0\r\n"
             .expect("broadcast inspection should succeed");
         assert_eq!(inspection.subscriber_ids, vec!["subscriber".to_string()]);
         assert!(inspection.publisher_id.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debug_room_snapshots_capture_broadcast_and_meeting_state() {
+        let manager = manager();
+        let broadcast_room = RoomId("debug-broadcast".to_string());
+        let meeting_room = RoomId("debug-meeting".to_string());
+
+        manager.ensure_room_mode(broadcast_room.clone(), RoomMode::Broadcast);
+        manager.ensure_room_mode(meeting_room.clone(), RoomMode::Meeting);
+        manager
+            .meeting_join(meeting_room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        manager
+            .meeting_publish_tracks(
+                meeting_room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-audio".to_string(),
+                    media_kind: crate::MediaKind::Audio,
+                    mid: None,
+                }],
+            )
+            .expect("alice publishes");
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &broadcast_room);
+            rs.publisher = Some(PublisherSession {
+                id: "publisher".to_string(),
+                peer: test_peer(&manager, "debug-broadcast-publisher", PeerRole::WhipPublisher).await,
+                ice: IceQueue::new(),
+            });
+        }
+
+        manager
+            .seed_broadcast_streams_for_test(broadcast_room.clone())
+            .expect("broadcast streams seeded");
+
+        let snapshots = manager.debug_room_snapshots();
+        assert_eq!(snapshots.len(), 2);
+
+        let broadcast = snapshots
+            .iter()
+            .find(|snapshot| snapshot.room_id == "debug-broadcast")
+            .expect("broadcast snapshot");
+        assert_eq!(broadcast.mode, RoomMode::Broadcast);
+        assert_eq!(broadcast.broadcast_streams, 2);
+        assert_eq!(broadcast.meeting_participants, 0);
+
+        let meeting = snapshots
+            .iter()
+            .find(|snapshot| snapshot.room_id == "debug-meeting")
+            .expect("meeting snapshot");
+        assert_eq!(meeting.mode, RoomMode::Meeting);
+        assert_eq!(meeting.meeting_participants, 1);
+        assert_eq!(meeting.meeting_publications, 1);
+        assert!(meeting.meeting_revision > 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
