@@ -255,7 +255,10 @@ Each snapshot currently includes:
 - `broadcast_publisher_active`
 - `broadcast_subscribers`
 - `broadcast_streams`
+- `broadcast_forwarding_edges`
 - `meeting_participants`
+- `meeting_requested_subscriptions`
+- `meeting_forwarding_edges`
 - `meeting_publications`
 - `meeting_streams`
 
@@ -264,4 +267,6 @@ This is intentionally lightweight and process-local. It is meant to help answer 
 - does the server still think the room is active?
 - did a subscriber disappear due to eviction or teardown?
 - are publications present but streams not yet observed?
+- are subscriptions requested but no forwarding edges compiled yet?
+- are forwarding edges present but media streams still missing?
 - is a meeting room revision advancing while media state remains empty?

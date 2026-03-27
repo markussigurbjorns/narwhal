@@ -109,7 +109,10 @@ pub struct RoomDebugSnapshot {
     pub broadcast_publisher_active: bool,
     pub broadcast_subscribers: usize,
     pub broadcast_streams: usize,
+    pub broadcast_forwarding_edges: usize,
     pub meeting_participants: usize,
+    pub meeting_requested_subscriptions: usize,
+    pub meeting_forwarding_edges: usize,
     pub meeting_publications: usize,
     pub meeting_streams: usize,
 }
@@ -248,6 +251,31 @@ impl PeerEvents for RoomPeerEvents {
 }
 
 impl RoomManager {
+    fn log_meeting_graph_state(
+        room: &RoomId,
+        participant_id: &str,
+        revision: u64,
+        rs: &RoomState,
+        reason: &'static str,
+    ) {
+        let requested_subscription_count = rs
+            .meeting
+            .subscription_requests
+            .values()
+            .map(std::collections::HashSet::len)
+            .sum::<usize>();
+        tracing::info!(
+            room = %room.0,
+            participant_id = %participant_id,
+            revision,
+            reason,
+            meeting_publications = rs.meeting.publications.len(),
+            requested_subscription_count,
+            forwarding_edge_count = rs.meeting_graph.edge_count(),
+            "meeting graph recomputed"
+        );
+    }
+
     pub fn new(gst: GstRuntime) -> Self {
         Self::with_config(gst, RoomManagerConfig::default())
     }
@@ -286,7 +314,15 @@ impl RoomManager {
                 broadcast_publisher_active: room.publisher.is_some(),
                 broadcast_subscribers: room.subscribers.len(),
                 broadcast_streams: room.broadcast_streams.len(),
+                broadcast_forwarding_edges: room.broadcast_graph.edge_count(),
                 meeting_participants: room.meeting.participants.len(),
+                meeting_requested_subscriptions: room
+                    .meeting
+                    .subscription_requests
+                    .values()
+                    .map(std::collections::HashSet::len)
+                    .sum(),
+                meeting_forwarding_edges: room.meeting_graph.edge_count(),
                 meeting_publications: room.meeting.publications.len(),
                 meeting_streams: room
                     .meeting_streams
@@ -634,6 +670,7 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        Self::log_meeting_graph_state(&room, participant_id, revision, rs, "publish_tracks");
         self.metrics.add_meeting_publish_tracks(track_count);
         Ok(revision)
     }
@@ -686,6 +723,7 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        Self::log_meeting_graph_state(&room, participant_id, revision, rs, "unpublish_tracks");
         self.metrics.add_meeting_unpublish_tracks(track_count);
         let mut affected_participant_ids = affected_participant_ids.into_iter().collect::<Vec<_>>();
         affected_participant_ids.sort();
@@ -738,6 +776,7 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        Self::log_meeting_graph_state(&room, participant_id, revision, rs, "subscribe");
         if added_any_track && let Some(session) = rs.meeting_participants.get_mut(participant_id) {
             let now = Instant::now();
             session.subscribe_started_at = Some(now);
@@ -776,6 +815,7 @@ impl RoomManager {
 
         let revision = rs.meeting.next_revision();
         Self::recompute_meeting_plan(rs);
+        Self::log_meeting_graph_state(&room, participant_id, revision, rs, "unsubscribe");
         self.metrics.inc_meeting_unsubscribe_requests();
         Ok(revision)
     }
@@ -1569,18 +1609,92 @@ impl RoomManager {
                 let entry = rs.meeting_streams.entry(track_id.clone()).or_default();
                 entry.entry(ssrc).or_insert_with(|| {
                     let encoding_id = rid.clone().unwrap_or_else(|| format!("ssrc:{ssrc}"));
-                    tracing::info!(
-                        room = %room.0,
-                        publisher_id = %publisher_id,
-                        track_id = %track_id_for_log,
-                        media_kind = ?media_kind,
-                        ssrc,
-                        encoding_id = %encoding_id,
-                        mid = mapped_mid.as_deref().unwrap_or(""),
-                        rid = rid.as_deref().unwrap_or(""),
-                        spatial_layer = spatial_layer.unwrap_or(u8::MAX),
-                        "observed meeting RTP stream"
-                    );
+                    match (mapped_mid.as_deref(), rid.as_deref(), spatial_layer) {
+                        (Some(mid), Some(rid), Some(spatial_layer)) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            mid = %mid,
+                            rid = %rid,
+                            spatial_layer,
+                            "observed meeting RTP stream"
+                        ),
+                        (Some(mid), Some(rid), None) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            mid = %mid,
+                            rid = %rid,
+                            "observed meeting RTP stream"
+                        ),
+                        (Some(mid), None, Some(spatial_layer)) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            mid = %mid,
+                            spatial_layer,
+                            "observed meeting RTP stream"
+                        ),
+                        (Some(mid), None, None) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            mid = %mid,
+                            "observed meeting RTP stream"
+                        ),
+                        (None, Some(rid), Some(spatial_layer)) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            rid = %rid,
+                            spatial_layer,
+                            "observed meeting RTP stream"
+                        ),
+                        (None, Some(rid), None) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            rid = %rid,
+                            "observed meeting RTP stream"
+                        ),
+                        (None, None, Some(spatial_layer)) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            spatial_layer,
+                            "observed meeting RTP stream"
+                        ),
+                        (None, None, None) => tracing::info!(
+                            room = %room.0,
+                            publisher_id = %publisher_id,
+                            track_id = %track_id_for_log,
+                            media_kind = ?media_kind,
+                            ssrc,
+                            encoding_id = %encoding_id,
+                            "observed meeting RTP stream"
+                        ),
+                    };
                     MeetingStreamInfo {
                         track_id: track_id_for_log,
                         publisher_id,
@@ -3726,6 +3840,7 @@ a=ssrc:1234 msid:test audio0\r\n"
             .expect("broadcast snapshot");
         assert_eq!(broadcast.mode, RoomMode::Broadcast);
         assert_eq!(broadcast.broadcast_streams, 2);
+        assert_eq!(broadcast.broadcast_forwarding_edges, 0);
         assert_eq!(broadcast.meeting_participants, 0);
 
         let meeting = snapshots
@@ -3734,6 +3849,8 @@ a=ssrc:1234 msid:test audio0\r\n"
             .expect("meeting snapshot");
         assert_eq!(meeting.mode, RoomMode::Meeting);
         assert_eq!(meeting.meeting_participants, 1);
+        assert_eq!(meeting.meeting_requested_subscriptions, 0);
+        assert_eq!(meeting.meeting_forwarding_edges, 0);
         assert_eq!(meeting.meeting_publications, 1);
         assert!(meeting.meeting_revision > 0);
     }

@@ -111,7 +111,10 @@ async fn periodic_room_snapshot_logger(rooms: RoomManager, interval: Duration) {
                 broadcast_publisher_active = snapshot.broadcast_publisher_active,
                 broadcast_subscribers = snapshot.broadcast_subscribers,
                 broadcast_streams = snapshot.broadcast_streams,
+                broadcast_forwarding_edges = snapshot.broadcast_forwarding_edges,
                 meeting_participants = snapshot.meeting_participants,
+                meeting_requested_subscriptions = snapshot.meeting_requested_subscriptions,
+                meeting_forwarding_edges = snapshot.meeting_forwarding_edges,
                 meeting_publications = snapshot.meeting_publications,
                 meeting_streams = snapshot.meeting_streams,
                 "room snapshot"

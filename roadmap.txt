@@ -102,7 +102,7 @@
 
   Exit criteria:
 
-  - you can explain a stalled subscriber from logs and metrics alone
+  ~ you can explain a stalled subscriber from logs and metrics alone
 
   ~ Phase 3: Backpressure And Overload Control
 

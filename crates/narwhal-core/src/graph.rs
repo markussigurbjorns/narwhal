@@ -49,6 +49,10 @@ impl ForwardingGraph {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    pub fn edge_count(&self) -> usize {
+        self.track_subscribers.values().map(Vec::len).sum()
+    }
 }
 
 pub fn compile_forwarding_graph(plan: &SubscriptionPlan) -> ForwardingGraph {
