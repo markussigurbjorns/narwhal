@@ -19,6 +19,8 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, sleep};
@@ -120,6 +122,10 @@ pub struct RoomManager {
     inner: Arc<RwLock<Rooms>>,
     #[cfg(test)]
     meeting_sdp_offer_test_hook: Arc<Mutex<Option<MeetingSdpOfferTestHook>>>,
+    #[cfg(test)]
+    publisher_keyframe_requests: Arc<AtomicUsize>,
+    #[cfg(test)]
+    meeting_participant_keyframe_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,6 +246,10 @@ impl RoomManager {
             })),
             #[cfg(test)]
             meeting_sdp_offer_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            publisher_keyframe_requests: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            meeting_participant_keyframe_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -689,7 +699,8 @@ impl RoomManager {
         if added_any_track && let Some(session) = rs.meeting_participants.get_mut(participant_id) {
             let now = Instant::now();
             session.subscribe_started_at = Some(now);
-            session.subscribe_keyframe_started_at = Some(now);
+            session.subscribe_keyframe_started_at =
+                (!new_video_publishers.is_empty()).then_some(now);
         }
         drop(g);
 
@@ -972,6 +983,25 @@ impl RoomManager {
         }
         self.forward_meeting_rtp(&room, publisher_id, pkt);
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn meeting_participant_warmup_state_for_test(
+        &self,
+        room: RoomId,
+        participant_id: &str,
+    ) -> Result<(bool, bool)> {
+        let g = self.inner.read();
+        let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+        Self::require_meeting_mode(rs)?;
+        let session = rs
+            .meeting_participants
+            .get(participant_id)
+            .ok_or_else(meeting_participant_session_not_found)?;
+        Ok((
+            session.subscribe_keyframe_started_at.is_some(),
+            session.first_join_video_keyframe_forwarded,
+        ))
     }
 
     pub async fn meeting_leave(&self, room: RoomId, participant_id: &str) -> Result<()> {
@@ -1740,6 +1770,10 @@ impl RoomManager {
         room: RoomId,
         participant_id: &str,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.meeting_participant_keyframe_requests
+            .fetch_add(1, Ordering::Relaxed);
+
         let peer = {
             let g = self.inner.read();
             let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
@@ -1755,6 +1789,9 @@ impl RoomManager {
     }
 
     async fn request_publisher_keyframe(&self, room: RoomId) -> Result<()> {
+        #[cfg(test)]
+        self.publisher_keyframe_requests.fetch_add(1, Ordering::Relaxed);
+
         let publisher = {
             let g = self.inner.read();
             let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
@@ -1794,7 +1831,7 @@ impl RoomManager {
             let ice = IceQueue::new();
             start_ice_collector(peer.ice_subscribe(), ice.clone());
 
-            let old_publisher = {
+            let (old_publisher, has_subscribers) = {
                 let mut g = self.inner.write();
                 let rs = Self::room_mut(&mut g, &room);
                 Self::require_broadcast_mode(rs)?;
@@ -1807,11 +1844,22 @@ impl RoomManager {
                     ice,
                 });
                 Self::recompute_broadcast_graph(rs);
-                old_publisher
+                (old_publisher, !rs.subscribers.is_empty())
             };
 
             if let Some(old_publisher) = old_publisher {
                 old_publisher.peer.stop().await?;
+            }
+
+            if has_subscribers {
+                if let Err(err) = self.request_publisher_keyframe(room.clone()).await {
+                    tracing::warn!(
+                        room = %room.0,
+                        publisher_id = %pub_id,
+                        cause = classify_negotiation_error(&err),
+                        "failed to request keyframe after publisher restart: {err:#}"
+                    );
+                }
             }
 
             let rooms = self.clone();
@@ -2528,6 +2576,36 @@ mod tests {
         peer
     }
 
+    async fn seed_meeting_participant_session(
+        manager: &RoomManager,
+        room: &RoomId,
+        participant_id: &str,
+        peer_id: &str,
+    ) {
+        let peer = test_peer(manager, peer_id, PeerRole::MeetingParticipant).await;
+        let (injector_tx, _injector_rx) = mpsc::channel(1);
+
+        let mut g = manager.inner.write();
+        let rs = g.rooms.get_mut(room).expect("room exists");
+        rs.meeting_participants.insert(
+            participant_id.to_string(),
+            MeetingParticipantSession {
+                id: participant_id.to_string(),
+                peer,
+                ice: IceQueue::new(),
+                injector_tx,
+                injector_overflow_streak: 0,
+                ssrc_to_mid: HashMap::new(),
+                mid_routing: HashMap::new(),
+                joined_at: Instant::now(),
+                first_join_rtp_forwarded: false,
+                first_join_video_keyframe_forwarded: false,
+                subscribe_started_at: None,
+                subscribe_keyframe_started_at: None,
+            },
+        );
+    }
+
     fn test_video_packet() -> RtpPacket {
         RtpPacket {
             pad_name: "src_0".to_string(),
@@ -2546,6 +2624,46 @@ mod tests {
             dts: None,
             duration: None,
         }
+    }
+
+    fn browser_like_offer_sdp() -> String {
+        "\
+v=0\r\n\
+o=- 4611733055804614137 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:1234 cname:test\r\n\
+a=ssrc:1234 msid:test audio0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=ssrc:5678 cname:test\r\n\
+a=ssrc:5678 msid:test video0\r\n"
+            .to_string()
     }
 
     fn simulcast_video_packet(ssrc: u32, rid: &str) -> RtpPacket {
@@ -2680,6 +2798,95 @@ mod tests {
         assert_eq!(effective_low_bandwidth.len(), 4);
         assert!(requested.contains(&"alice-video-4".to_string()));
         assert!(!effective_low_bandwidth.contains(&"alice-video-4".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_audio_only_subscribe_does_not_arm_keyframe_warmup() {
+        let manager = manager();
+        let room = RoomId("meeting-audio-only-subscribe".to_string());
+        manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        manager
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+        manager
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-audio".to_string(),
+                    media_kind: crate::MediaKind::Audio,
+                    mid: None,
+                }],
+            )
+            .expect("alice publishes audio");
+        seed_meeting_participant_session(&manager, &room, "bob", "bob-audio-only-peer").await;
+
+        manager
+            .meeting_subscribe(room.clone(), "bob", vec!["alice-audio".to_string()])
+            .expect("bob subscribes to audio");
+
+        let g = manager.inner.read();
+        let rs = g.rooms.get(&room).expect("room exists");
+        let session = rs
+            .meeting_participants
+            .get("bob")
+            .expect("bob session exists");
+        assert!(session.subscribe_started_at.is_some());
+        assert!(session.subscribe_keyframe_started_at.is_none());
+        assert_eq!(
+            manager
+                .meeting_participant_keyframe_requests
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_video_subscribe_arms_keyframe_warmup() {
+        let manager = manager();
+        let room = RoomId("meeting-video-subscribe-warmup".to_string());
+
+        manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        manager
+            .meeting_join(room.clone(), "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins");
+        manager
+            .meeting_publish_tracks(
+                room.clone(),
+                "alice",
+                vec![MeetingPublishTrack {
+                    track_id: "alice-video".to_string(),
+                    media_kind: crate::MediaKind::Video,
+                    mid: None,
+                }],
+            )
+            .expect("alice publishes video");
+        seed_meeting_participant_session(&manager, &room, "alice", "alice-video-warmup-peer").await;
+        seed_meeting_participant_session(&manager, &room, "bob", "bob-video-warmup-peer").await;
+
+        manager
+            .meeting_subscribe(room.clone(), "bob", vec!["alice-video".to_string()])
+            .expect("bob subscribes to video");
+        tokio::task::yield_now().await;
+
+        let g = manager.inner.read();
+        let rs = g.rooms.get(&room).expect("room exists");
+        let session = rs
+            .meeting_participants
+            .get("bob")
+            .expect("bob session exists");
+        assert!(session.subscribe_started_at.is_some());
+        assert!(session.subscribe_keyframe_started_at.is_some());
+        assert!(
+            manager
+                .meeting_participant_keyframe_requests
+                .load(Ordering::Relaxed)
+                >= 1
+        );
     }
 
     #[test]
@@ -3352,6 +3559,56 @@ a=ssrc:1234 msid:test audio0\r\n"
             "narwhal_subscriber_evictions_total{mode=\"broadcast\",reason=\"slow_consumer\"} 1"
         ));
         assert!(rendered.contains("narwhal_broadcast_subscribers_stopped_total 1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whip_publish_restart_requests_keyframe_for_existing_subscribers() {
+        let manager = manager();
+        let room = RoomId("broadcast-publisher-restart".to_string());
+        let publisher_peer = test_peer(&manager, "pub-peer-old", PeerRole::WhipPublisher).await;
+        let subscriber_peer = test_peer(&manager, "sub-peer-restart", PeerRole::WhepSubscriber).await;
+        let (tx, _rx) = mpsc::channel(1);
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Broadcast;
+            rs.publisher = Some(PublisherSession {
+                id: "publisher-old".to_string(),
+                peer: publisher_peer,
+                ice: IceQueue::new(),
+            });
+            rs.subscribers.insert(
+                "subscriber".to_string(),
+                SubscriberSession {
+                    id: "subscriber".to_string(),
+                    peer: subscriber_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: tx,
+                    injector_overflow_streak: 0,
+                    subscribed_at: Instant::now(),
+                    first_rtp_forwarded: true,
+                    first_video_keyframe_forwarded: true,
+                },
+            );
+            RoomManager::recompute_broadcast_graph(rs);
+        }
+
+        manager
+            .whip_publish(room.clone(), browser_like_offer_sdp())
+            .await
+            .expect("publisher restart should succeed");
+
+        assert_eq!(
+            manager.publisher_keyframe_requests.load(Ordering::Relaxed),
+            1
+        );
+
+        let inspection = manager
+            .broadcast_inspect(room)
+            .expect("broadcast inspection should succeed");
+        assert_eq!(inspection.subscriber_ids, vec!["subscriber".to_string()]);
+        assert!(inspection.publisher_id.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

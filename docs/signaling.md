@@ -176,6 +176,8 @@ Notes:
 
 - current behavior is replace-on-new-publisher
 - starting a new publisher replaces the previous one for the room
+- existing WHEP subscribers stay attached across publisher replacement
+- when a publisher is replaced while subscribers are still present, the server immediately requests a fresh video keyframe from the new publisher to warm those subscribers back up
 - deleting the same publisher resource more than once is treated as a no-op
 - `PATCH` on an existing publisher resource now accepts either JSON ICE trickle or raw SDP renegotiation
 - WHIP restart offers are accepted on the existing resource, but answer-side ICE credential rotation is still delegated to the underlying media stack and is not yet asserted as a stable wire guarantee

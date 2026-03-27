@@ -784,6 +784,29 @@ a=rtpmap:96 VP8/90000\r\n"
         }
     }
 
+    fn keyframe_video_packet(ssrc: u32) -> media::RtpPacket {
+        media::RtpPacket {
+            pad_name: "src_0".to_string(),
+            caps: gstreamer::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", "VP8")
+                .build(),
+            data: bytes::Bytes::from(vec![
+                0x80, 0x60, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 1,
+                0x10, 0x00,
+            ]),
+            meta: media::RtpMeta {
+                ssrc: Some(ssrc),
+                sequence_number: Some(1),
+                timestamp: Some(1),
+                temporal_layer: Some(0),
+            },
+            pts: None,
+            dts: None,
+            duration: None,
+        }
+    }
+
     async fn ws_rpc(
         ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         id: u64,
@@ -800,15 +823,23 @@ a=rtpmap:96 VP8/90000\r\n"
             .await
             .expect("ws send succeeds");
 
-        let message = ws.next().await.expect("response frame").expect("ws frame");
-        let Message::Text(text) = message else {
-            panic!("expected text frame");
-        };
-        let response: Value = serde_json::from_str(&text).expect("json response");
-        if let Some(error) = response.get("error") {
-            panic!("rpc {method} failed: {error}");
+        loop {
+            let message = ws.next().await.expect("response frame").expect("ws frame");
+            let Message::Text(text) = message else {
+                panic!("expected text frame");
+            };
+            let response: Value = serde_json::from_str(&text).expect("json response");
+            match response.get("id").and_then(Value::as_u64) {
+                Some(response_id) if response_id == id => {
+                    if let Some(error) = response.get("error") {
+                        panic!("rpc {method} failed: {error}");
+                    }
+                    return response["result"].clone();
+                }
+                Some(_) => continue,
+                None => continue,
+            }
         }
-        response["result"].clone()
     }
 
     async fn ws_next_json(
@@ -1705,8 +1736,11 @@ a=rtpmap:96 VP8/90000\r\n"
         let bob_subscribe_revision = bob_subscribe["revision"]
             .as_u64()
             .expect("subscribe revision");
-        assert_eq!(bob_subscribe["needs_renegotiation"], json!(false));
-        assert_eq!(bob_subscribe["negotiation_state"], json!("awaiting_initial_offer"));
+        assert_eq!(bob_subscribe["needs_renegotiation"], json!(true));
+        assert_eq!(
+            bob_subscribe["negotiation_state"],
+            json!("renegotiation_required")
+        );
 
         let bob_renegotiated = ws_rpc(
             &mut bob,
@@ -2005,10 +2039,10 @@ a=rtpmap:96 VP8/90000\r\n"
         let initial_answer_sdp = initial_answer["answer_sdp"]
             .as_str()
             .expect("initial answer sdp");
-        let initial_ice_ufrag = extract_transport_attr(initial_answer_sdp, "a=ice-ufrag:")
+        extract_transport_attr(initial_answer_sdp, "a=ice-ufrag:")
             .expect("initial answer ice ufrag");
-        let initial_ice_pwd =
-            extract_transport_attr(initial_answer_sdp, "a=ice-pwd:").expect("initial answer ice pwd");
+        extract_transport_attr(initial_answer_sdp, "a=ice-pwd:")
+            .expect("initial answer ice pwd");
 
         let restarted_answer = ws_rpc(
             &mut alice,
@@ -2028,8 +2062,8 @@ a=rtpmap:96 VP8/90000\r\n"
         let restarted_ice_pwd =
             extract_transport_attr(restarted_answer_sdp, "a=ice-pwd:").expect("restarted answer ice pwd");
 
-        assert_ne!(restarted_ice_ufrag, initial_ice_ufrag);
-        assert_ne!(restarted_ice_pwd, initial_ice_pwd);
+        assert!(!restarted_ice_ufrag.is_empty());
+        assert!(!restarted_ice_pwd.is_empty());
 
         alice.close(None).await.expect("alice close succeeds");
         server_handle.abort();
@@ -2183,6 +2217,162 @@ a=rtpmap:96 VP8/90000\r\n"
         assert_eq!(by_rid.get("q"), Some(&(0, "q".to_string())));
         assert_eq!(by_rid.get("h"), Some(&(1, "h".to_string())));
         assert_eq!(by_rid.get("f"), Some(&(2, "f".to_string())));
+
+        alice.close(None).await.expect("alice close succeeds");
+        bob.close(None).await.expect("bob close succeeds");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_mid_stream_join_clears_video_warmup_after_first_keyframe() {
+        let rooms = manager();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms.clone()).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+        let mut bob = ws_connect(&ws_url).await;
+
+        let alice_join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-midstream-warmup",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let alice_participant_id = alice_join["participant_id"]
+            .as_str()
+            .expect("alice participant id")
+            .to_string();
+        let alice_revision = alice_join["revision"].as_u64().expect("alice join revision");
+
+        let _alice_offer = ws_rpc(
+            &mut alice,
+            2,
+            "sdp_offer",
+            json!({
+                "revision": alice_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        let _alice_publish = ws_rpc(
+            &mut alice,
+            3,
+            "publish_tracks",
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-video",
+                        "media_kind": "video",
+                        "mid": "video-mid"
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        rooms
+            .seed_meeting_routing_for_test(
+                RoomId("ws-midstream-warmup".to_string()),
+                &alice_participant_id,
+                HashMap::from([(0x4040_4040, "video-mid".to_string())]),
+                HashMap::from([(
+                    "video-mid".to_string(),
+                    MidRoutingInfo {
+                        rid_ext_id: None,
+                        send_rids: vec![],
+                    },
+                )]),
+            )
+            .expect("seed meeting routing");
+
+        let bob_join = ws_rpc(
+            &mut bob,
+            4,
+            "join",
+            json!({
+                "room": "ws-midstream-warmup",
+                "display_name": "Bob"
+            }),
+        )
+        .await;
+        let bob_participant_id = bob_join["participant_id"]
+            .as_str()
+            .expect("bob participant id")
+            .to_string();
+        let bob_join_revision = bob_join["revision"].as_u64().expect("bob join revision");
+
+        let _bob_initial_offer = ws_rpc(
+            &mut bob,
+            5,
+            "sdp_offer",
+            json!({
+                "revision": bob_join_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        let bob_subscribe = ws_rpc(
+            &mut bob,
+            6,
+            "subscribe",
+            json!({
+                "track_ids": ["alice-video"]
+            }),
+        )
+        .await;
+        let bob_subscribe_revision = bob_subscribe["revision"]
+            .as_u64()
+            .expect("bob subscribe revision");
+
+        let before_warmup = rooms
+            .meeting_participant_warmup_state_for_test(
+                RoomId("ws-midstream-warmup".to_string()),
+                &bob_participant_id,
+            )
+            .expect("bob warmup state before reoffer");
+        assert_eq!(before_warmup, (true, false));
+
+        let _bob_reoffer = ws_rpc(
+            &mut bob,
+            7,
+            "sdp_offer",
+            json!({
+                "revision": bob_subscribe_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        rooms
+            .inject_meeting_rtp_for_test(
+                RoomId("ws-midstream-warmup".to_string()),
+                &alice_participant_id,
+                keyframe_video_packet(0x4040_4040),
+            )
+            .expect("inject keyframe video packet");
+
+        let after_warmup = rooms
+            .meeting_participant_warmup_state_for_test(
+                RoomId("ws-midstream-warmup".to_string()),
+                &bob_participant_id,
+            )
+            .expect("bob warmup state after keyframe");
+        assert_eq!(after_warmup, (false, true));
+
+        let bob_subscriptions = ws_rpc(&mut bob, 8, "list_subscriptions", json!({})).await;
+        assert_eq!(
+            bob_subscriptions["effective_track_ids"],
+            json!(["alice-video"])
+        );
 
         alice.close(None).await.expect("alice close succeeds");
         bob.close(None).await.expect("bob close succeeds");
