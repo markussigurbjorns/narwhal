@@ -935,6 +935,45 @@ impl RoomManager {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn seed_meeting_routing_for_test(
+        &self,
+        room: RoomId,
+        participant_id: &str,
+        ssrc_to_mid: HashMap<u32, String>,
+        mid_routing: HashMap<String, MidRoutingInfo>,
+    ) -> Result<()> {
+        let mut g = self.inner.write();
+        let rs = g.rooms.get_mut(&room).ok_or_else(room_not_found)?;
+        Self::require_meeting_mode(rs)?;
+        let session = rs
+            .meeting_participants
+            .get_mut(participant_id)
+            .ok_or_else(meeting_participant_session_not_found)?;
+        session.ssrc_to_mid = ssrc_to_mid;
+        session.mid_routing = mid_routing;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn inject_meeting_rtp_for_test(
+        &self,
+        room: RoomId,
+        publisher_id: &str,
+        pkt: RtpPacket,
+    ) -> Result<()> {
+        {
+            let g = self.inner.read();
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+            Self::require_meeting_mode(rs)?;
+            if !rs.meeting_participants.contains_key(publisher_id) {
+                return Err(meeting_participant_session_not_found());
+            }
+        }
+        self.forward_meeting_rtp(&room, publisher_id, pkt);
+        Ok(())
+    }
+
     pub async fn meeting_leave(&self, room: RoomId, participant_id: &str) -> Result<()> {
         self.meeting_leave_with_outcome(room, participant_id)
             .await
@@ -2509,6 +2548,53 @@ mod tests {
         }
     }
 
+    fn simulcast_video_packet(ssrc: u32, rid: &str) -> RtpPacket {
+        let rid_bytes = rid.as_bytes();
+        assert_eq!(rid_bytes.len(), 1, "test helper expects a one-byte RID");
+        RtpPacket {
+            pad_name: "src_0".to_string(),
+            caps: gst::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", "VP8")
+                .build(),
+            data: Bytes::from(vec![
+                0x90,
+                0x60,
+                0x00,
+                0x01,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+                0xBE,
+                0xDE,
+                0x00,
+                0x01,
+                0x40,
+                rid_bytes[0],
+                0x00,
+                0x00,
+            ]),
+            meta: media::RtpMeta {
+                ssrc: Some(ssrc),
+                sequence_number: Some(1),
+                timestamp: Some(1),
+                temporal_layer: None,
+            },
+            pts: None,
+            dts: None,
+            duration: None,
+        }
+    }
+
+    fn clear_channel<T>(rx: &mut mpsc::Receiver<T>) {
+        while rx.try_recv().is_ok() {}
+    }
+
     fn publish_tracks() -> Vec<MeetingPublishTrack> {
         vec![
             MeetingPublishTrack {
@@ -2823,6 +2909,346 @@ a=ssrc:1234 msid:test audio0\r\n"
         assert_eq!(streams[0].mid, None);
         assert_eq!(streams[0].rid, None);
         assert_eq!(streams[0].spatial_layer, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn simulcast_streams_track_rid_and_low_target_prefers_low_encoding() {
+        let manager = manager();
+        let room = RoomId("room-simulcast-routing".to_string());
+        let alice_peer = test_peer(&manager, "alice-simulcast-peer", PeerRole::MeetingParticipant).await;
+        let bob_peer = test_peer(&manager, "bob-simulcast-peer", PeerRole::MeetingParticipant).await;
+        let (bob_tx, mut bob_rx) = mpsc::channel(16);
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Meeting;
+            rs.meeting.participants.insert(
+                ParticipantId("alice".to_string()),
+                ParticipantState {
+                    id: ParticipantId("alice".to_string()),
+                    display_name: Some("Alice".to_string()),
+                },
+            );
+            rs.meeting.participants.insert(
+                ParticipantId("bob".to_string()),
+                ParticipantState {
+                    id: ParticipantId("bob".to_string()),
+                    display_name: Some("Bob".to_string()),
+                },
+            );
+            rs.meeting.publications.insert(
+                crate::TrackId("alice-video".to_string()),
+                crate::Publication {
+                    track_id: crate::TrackId("alice-video".to_string()),
+                    publisher: ParticipantId("alice".to_string()),
+                    media_kind: crate::MediaKind::Video,
+                    mid: Some("video-mid".to_string()),
+                },
+            );
+            rs.meeting
+                .subscription_requests
+                .entry(ParticipantId("bob".to_string()))
+                .or_default()
+                .insert(crate::TrackId("alice-video".to_string()));
+            rs.meeting_participants.insert(
+                "alice".to_string(),
+                MeetingParticipantSession {
+                    id: "alice".to_string(),
+                    peer: alice_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: mpsc::channel(1).0,
+                    injector_overflow_streak: 0,
+                    ssrc_to_mid: HashMap::from([
+                        (0x1010_1010, "video-mid".to_string()),
+                        (0x2020_2020, "video-mid".to_string()),
+                        (0x3030_3030, "video-mid".to_string()),
+                    ]),
+                    mid_routing: HashMap::from([(
+                        "video-mid".to_string(),
+                        MidRoutingInfo {
+                            rid_ext_id: Some(4),
+                            send_rids: vec!["q".to_string(), "h".to_string(), "f".to_string()],
+                        },
+                    )]),
+                    joined_at: Instant::now(),
+                    first_join_rtp_forwarded: false,
+                    first_join_video_keyframe_forwarded: false,
+                    subscribe_started_at: None,
+                    subscribe_keyframe_started_at: None,
+                },
+            );
+            rs.meeting_participants.insert(
+                "bob".to_string(),
+                MeetingParticipantSession {
+                    id: "bob".to_string(),
+                    peer: bob_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: bob_tx,
+                    injector_overflow_streak: 0,
+                    ssrc_to_mid: HashMap::new(),
+                    mid_routing: HashMap::new(),
+                    joined_at: Instant::now(),
+                    first_join_rtp_forwarded: false,
+                    first_join_video_keyframe_forwarded: false,
+                    subscribe_started_at: None,
+                    subscribe_keyframe_started_at: None,
+                },
+            );
+            RoomManager::recompute_meeting_plan(rs);
+            let forwardings = rs
+                .meeting_graph
+                .track_subscribers
+                .get_mut(&crate::TrackId("alice-video".to_string()))
+                .expect("forwarding for alice-video");
+            assert_eq!(forwardings.len(), 1);
+            forwardings[0].kind = ForwardingKind::Video(VideoForwarding {
+                target: crate::VideoTarget::Low,
+                spatial_layer: Some(0),
+                temporal_layer: Some(0),
+                preferred_encoding_id: None,
+            });
+        }
+
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x1010_1010, "q"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x2020_2020, "h"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x3030_3030, "f"));
+
+        let streams = manager
+            .meeting_list_streams(room.clone())
+            .expect("meeting streams should be listable");
+        assert_eq!(streams.len(), 3);
+        let by_rid = streams
+            .iter()
+            .map(|stream| {
+                (
+                    stream.rid.clone().expect("simulcast stream rid"),
+                    (stream.spatial_layer, stream.encoding_id.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            by_rid.get("q"),
+            Some(&(Some(0), "q".to_string()))
+        );
+        assert_eq!(
+            by_rid.get("h"),
+            Some(&(Some(1), "h".to_string()))
+        );
+        assert_eq!(
+            by_rid.get("f"),
+            Some(&(Some(2), "f".to_string()))
+        );
+
+        while bob_rx.try_recv().is_ok() {}
+
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x1010_1010, "q"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x2020_2020, "h"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x3030_3030, "f"));
+
+        let forwarded = bob_rx.recv().await.expect("one low simulcast packet forwarded");
+        assert_eq!(parse_rtp_rid(&forwarded.data, 4), Some("q".to_string()));
+        assert!(bob_rx.try_recv().is_err());
+
+        {
+            let mut g = manager.inner.write();
+            let rs = g.rooms.get_mut(&room).expect("room exists");
+            let forwardings = rs
+                .meeting_graph
+                .track_subscribers
+                .get_mut(&crate::TrackId("alice-video".to_string()))
+                .expect("forwarding for alice-video");
+            forwardings[0].kind = ForwardingKind::Video(VideoForwarding {
+                target: crate::VideoTarget::Medium,
+                spatial_layer: Some(1),
+                temporal_layer: Some(1),
+                preferred_encoding_id: None,
+            });
+            hydrate_meeting_graph(&mut rs.meeting_graph, &rs.meeting_streams);
+        }
+        clear_channel(&mut bob_rx);
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x1010_1010, "q"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x2020_2020, "h"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x3030_3030, "f"));
+
+        let forwarded = bob_rx
+            .recv()
+            .await
+            .expect("one medium simulcast packet forwarded");
+        assert_eq!(parse_rtp_rid(&forwarded.data, 4), Some("h".to_string()));
+        assert!(bob_rx.try_recv().is_err());
+
+        {
+            let mut g = manager.inner.write();
+            let rs = g.rooms.get_mut(&room).expect("room exists");
+            let forwardings = rs
+                .meeting_graph
+                .track_subscribers
+                .get_mut(&crate::TrackId("alice-video".to_string()))
+                .expect("forwarding for alice-video");
+            forwardings[0].kind = ForwardingKind::Video(VideoForwarding {
+                target: crate::VideoTarget::High,
+                spatial_layer: Some(2),
+                temporal_layer: Some(2),
+                preferred_encoding_id: None,
+            });
+            hydrate_meeting_graph(&mut rs.meeting_graph, &rs.meeting_streams);
+        }
+        clear_channel(&mut bob_rx);
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x1010_1010, "q"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x2020_2020, "h"));
+        manager.forward_meeting_rtp(&room, "alice", simulcast_video_packet(0x3030_3030, "f"));
+
+        let forwarded = bob_rx
+            .recv()
+            .await
+            .expect("one high simulcast packet forwarded");
+        assert_eq!(parse_rtp_rid(&forwarded.data, 4), Some("f".to_string()));
+        assert!(bob_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_rid_falls_back_to_ssrc_encoding_id_for_selection() {
+        let manager = manager();
+        let room = RoomId("room-simulcast-ssrc-fallback".to_string());
+        let alice_peer = test_peer(&manager, "alice-fallback-peer", PeerRole::MeetingParticipant).await;
+        let bob_peer = test_peer(&manager, "bob-fallback-peer", PeerRole::MeetingParticipant).await;
+        let (bob_tx, mut bob_rx) = mpsc::channel(16);
+
+        {
+            let mut g = manager.inner.write();
+            let rs = RoomManager::room_mut(&mut g, &room);
+            rs.mode = RoomMode::Meeting;
+            rs.meeting.participants.insert(
+                ParticipantId("alice".to_string()),
+                ParticipantState {
+                    id: ParticipantId("alice".to_string()),
+                    display_name: Some("Alice".to_string()),
+                },
+            );
+            rs.meeting.participants.insert(
+                ParticipantId("bob".to_string()),
+                ParticipantState {
+                    id: ParticipantId("bob".to_string()),
+                    display_name: Some("Bob".to_string()),
+                },
+            );
+            rs.meeting.publications.insert(
+                crate::TrackId("alice-video".to_string()),
+                crate::Publication {
+                    track_id: crate::TrackId("alice-video".to_string()),
+                    publisher: ParticipantId("alice".to_string()),
+                    media_kind: crate::MediaKind::Video,
+                    mid: None,
+                },
+            );
+            rs.meeting
+                .subscription_requests
+                .entry(ParticipantId("bob".to_string()))
+                .or_default()
+                .insert(crate::TrackId("alice-video".to_string()));
+            rs.meeting_participants.insert(
+                "alice".to_string(),
+                MeetingParticipantSession {
+                    id: "alice".to_string(),
+                    peer: alice_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: mpsc::channel(1).0,
+                    injector_overflow_streak: 0,
+                    ssrc_to_mid: HashMap::new(),
+                    mid_routing: HashMap::new(),
+                    joined_at: Instant::now(),
+                    first_join_rtp_forwarded: false,
+                    first_join_video_keyframe_forwarded: false,
+                    subscribe_started_at: None,
+                    subscribe_keyframe_started_at: None,
+                },
+            );
+            rs.meeting_participants.insert(
+                "bob".to_string(),
+                MeetingParticipantSession {
+                    id: "bob".to_string(),
+                    peer: bob_peer,
+                    ice: IceQueue::new(),
+                    injector_tx: bob_tx,
+                    injector_overflow_streak: 0,
+                    ssrc_to_mid: HashMap::new(),
+                    mid_routing: HashMap::new(),
+                    joined_at: Instant::now(),
+                    first_join_rtp_forwarded: false,
+                    first_join_video_keyframe_forwarded: false,
+                    subscribe_started_at: None,
+                    subscribe_keyframe_started_at: None,
+                },
+            );
+            RoomManager::recompute_meeting_plan(rs);
+            let forwardings = rs
+                .meeting_graph
+                .track_subscribers
+                .get_mut(&crate::TrackId("alice-video".to_string()))
+                .expect("forwarding for alice-video");
+            forwardings[0].kind = ForwardingKind::Video(VideoForwarding {
+                target: crate::VideoTarget::Low,
+                spatial_layer: Some(0),
+                temporal_layer: Some(0),
+                preferred_encoding_id: None,
+            });
+        }
+
+        manager.forward_meeting_rtp(
+            &room,
+            "alice",
+            test_video_packet(),
+        );
+        manager.forward_meeting_rtp(
+            &room,
+            "alice",
+            RtpPacket {
+                meta: media::RtpMeta {
+                    ssrc: Some(0x5566_7788),
+                    sequence_number: Some(2),
+                    timestamp: Some(2),
+                    temporal_layer: Some(0),
+                },
+                ..test_video_packet()
+            },
+        );
+
+        let streams = manager
+            .meeting_list_streams(room.clone())
+            .expect("meeting streams should be listable");
+        let encoding_ids = streams
+            .iter()
+            .map(|stream| stream.encoding_id.clone())
+            .collect::<Vec<_>>();
+        assert!(encoding_ids.contains(&"ssrc:287454020".to_string()));
+        assert!(encoding_ids.contains(&"ssrc:1432778632".to_string()));
+
+        {
+            let mut g = manager.inner.write();
+            let rs = g.rooms.get_mut(&room).expect("room exists");
+            hydrate_meeting_graph(&mut rs.meeting_graph, &rs.meeting_streams);
+        }
+
+        clear_channel(&mut bob_rx);
+        manager.forward_meeting_rtp(&room, "alice", test_video_packet());
+        manager.forward_meeting_rtp(
+            &room,
+            "alice",
+            RtpPacket {
+                meta: media::RtpMeta {
+                    ssrc: Some(0x5566_7788),
+                    sequence_number: Some(2),
+                    timestamp: Some(2),
+                    temporal_layer: Some(0),
+                },
+                ..test_video_packet()
+            },
+        );
+
+        let forwarded = bob_rx.recv().await.expect("one fallback packet forwarded");
+        assert_eq!(forwarded.meta.ssrc, Some(0x5566_7788));
+        assert!(bob_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

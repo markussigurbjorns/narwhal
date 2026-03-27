@@ -622,8 +622,9 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use media::GstRuntime;
-    use narwhal_core::{MediaKind, MeetingPublishTrack, RoomId, RoomManager, RoomMode};
+    use narwhal_core::{MediaKind, MeetingPublishTrack, MidRoutingInfo, RoomId, RoomManager, RoomMode};
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
     use tower::util::ServiceExt;
@@ -738,6 +739,49 @@ a=rtpmap:96 VP8/90000\r\n"
     fn extract_transport_attr(sdp: &str, prefix: &str) -> Option<String> {
         sdp.lines()
             .find_map(|line| line.strip_prefix(prefix).map(|rest| rest.trim().to_string()))
+    }
+
+    fn simulcast_video_packet(ssrc: u32, rid: &str) -> media::RtpPacket {
+        let rid_bytes = rid.as_bytes();
+        assert_eq!(rid_bytes.len(), 1, "test helper expects a one-byte RID");
+        media::RtpPacket {
+            pad_name: "src_0".to_string(),
+            caps: gstreamer::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", "VP8")
+                .build(),
+            data: bytes::Bytes::from(vec![
+                0x90,
+                0x60,
+                0x00,
+                0x01,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+                0xBE,
+                0xDE,
+                0x00,
+                0x01,
+                0x40,
+                rid_bytes[0],
+                0x00,
+                0x00,
+            ]),
+            meta: media::RtpMeta {
+                ssrc: Some(ssrc),
+                sequence_number: Some(1),
+                timestamp: Some(1),
+                temporal_layer: None,
+            },
+            pts: None,
+            dts: None,
+            duration: None,
+        }
     }
 
     async fn ws_rpc(
@@ -1988,6 +2032,160 @@ a=rtpmap:96 VP8/90000\r\n"
         assert_ne!(restarted_ice_pwd, initial_ice_pwd);
 
         alice.close(None).await.expect("alice close succeeds");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_route_lists_simulcast_streams_with_rid_and_spatial_layers() {
+        let rooms = manager();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms.clone()).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+        let mut bob = ws_connect(&ws_url).await;
+
+        let alice_join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-simulcast-streams",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let alice_participant_id = alice_join["participant_id"]
+            .as_str()
+            .expect("alice participant id")
+            .to_string();
+        let alice_revision = alice_join["revision"].as_u64().expect("alice join revision");
+
+        let bob_join = ws_rpc(
+            &mut bob,
+            2,
+            "join",
+            json!({
+                "room": "ws-simulcast-streams",
+                "display_name": "Bob"
+            }),
+        )
+        .await;
+        let bob_revision = bob_join["revision"].as_u64().expect("bob join revision");
+
+        let _alice_offer = ws_rpc(
+            &mut alice,
+            3,
+            "sdp_offer",
+            json!({
+                "revision": alice_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        let _bob_offer = ws_rpc(
+            &mut bob,
+            4,
+            "sdp_offer",
+            json!({
+                "revision": bob_revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+
+        let _alice_publish = ws_rpc(
+            &mut alice,
+            5,
+            "publish_tracks",
+            json!({
+                "tracks": [
+                    {
+                        "track_id": "alice-video",
+                        "media_kind": "video",
+                        "mid": "video-mid"
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let _bob_subscribe = ws_rpc(
+            &mut bob,
+            6,
+            "subscribe",
+            json!({
+                "track_ids": ["alice-video"]
+            }),
+        )
+        .await;
+
+        rooms
+            .seed_meeting_routing_for_test(
+                RoomId("ws-simulcast-streams".to_string()),
+                &alice_participant_id,
+                HashMap::from([
+                    (0x1010_1010, "video-mid".to_string()),
+                    (0x2020_2020, "video-mid".to_string()),
+                    (0x3030_3030, "video-mid".to_string()),
+                ]),
+                HashMap::from([(
+                    "video-mid".to_string(),
+                    MidRoutingInfo {
+                        rid_ext_id: Some(4),
+                        send_rids: vec!["q".to_string(), "h".to_string(), "f".to_string()],
+                    },
+                )]),
+            )
+            .expect("seed meeting routing");
+
+        rooms
+            .inject_meeting_rtp_for_test(
+                RoomId("ws-simulcast-streams".to_string()),
+                &alice_participant_id,
+                simulcast_video_packet(0x1010_1010, "q"),
+            )
+            .expect("inject q stream");
+        rooms
+            .inject_meeting_rtp_for_test(
+                RoomId("ws-simulcast-streams".to_string()),
+                &alice_participant_id,
+                simulcast_video_packet(0x2020_2020, "h"),
+            )
+            .expect("inject h stream");
+        rooms
+            .inject_meeting_rtp_for_test(
+                RoomId("ws-simulcast-streams".to_string()),
+                &alice_participant_id,
+                simulcast_video_packet(0x3030_3030, "f"),
+            )
+            .expect("inject f stream");
+
+        let listed = ws_rpc(&mut bob, 7, "list_streams", json!({})).await;
+        let streams = listed["streams"].as_array().expect("streams array");
+        assert_eq!(streams.len(), 3);
+
+        let by_rid = streams
+            .iter()
+            .map(|stream| {
+                (
+                    stream["rid"].as_str().expect("rid").to_string(),
+                    (
+                        stream["spatial_layer"].as_u64().expect("spatial layer"),
+                        stream["encoding_id"].as_str().expect("encoding id").to_string(),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_rid.get("q"), Some(&(0, "q".to_string())));
+        assert_eq!(by_rid.get("h"), Some(&(1, "h".to_string())));
+        assert_eq!(by_rid.get("f"), Some(&(2, "f".to_string())));
+
+        alice.close(None).await.expect("alice close succeeds");
+        bob.close(None).await.expect("bob close succeeds");
         server_handle.abort();
     }
 

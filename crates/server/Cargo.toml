@@ -17,6 +17,7 @@ narwhal-core = { path = "../narwhal-core" }
 
 [dev-dependencies]
 futures-util = "0.3.31"
+gstreamer = { version = "0.25.0", features = ["v1_16"] }
 media = { path = "../media" }
 tokio = { version = "1.49.0", features = ["macros", "rt", "time"] }
 tokio-tungstenite = "0.28.0"

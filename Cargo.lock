@@ -1105,6 +1105,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "gstreamer",
  "media",
  "narwhal-core",
  "serde",
