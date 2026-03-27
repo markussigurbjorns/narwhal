@@ -2380,6 +2380,90 @@ a=rtpmap:96 VP8/90000\r\n"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ws_disconnect_during_negotiation_still_cleans_up_and_allows_reconnect() {
+        let rooms = manager();
+        let hook = rooms.install_meeting_sdp_offer_test_hook();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms.clone()).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+        let join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-disconnect-during-negotiation",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let first_participant_id = join["participant_id"]
+            .as_str()
+            .expect("participant id")
+            .to_string();
+        let revision = join["revision"].as_u64().expect("join revision");
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "sdp_offer",
+            "params": {
+                "revision": revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }
+        });
+        alice
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .expect("offer send succeeds");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), hook.wait_started())
+            .await
+            .expect("negotiation should reach test hook");
+        alice.close(None).await.expect("alice close succeeds");
+        hook.release();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let participants = rooms
+                    .meeting_list_participants(RoomId(
+                        "ws-disconnect-during-negotiation".to_string(),
+                    ))
+                    .expect("participants should remain listable");
+                if participants.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect cleanup should remove participant");
+
+        let mut rejoined = ws_connect(&ws_url).await;
+        let second_join = ws_rpc(
+            &mut rejoined,
+            3,
+            "join",
+            json!({
+                "room": "ws-disconnect-during-negotiation",
+                "display_name": "Alice Rejoined"
+            }),
+        )
+        .await;
+        let second_participant_id = second_join["participant_id"]
+            .as_str()
+            .expect("participant id")
+            .to_string();
+        assert_ne!(second_participant_id, first_participant_id);
+
+        rejoined.close(None).await.expect("rejoined close succeeds");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn ws_upgrade_returns_service_unavailable_when_draining() {
         let state = AppState::new(manager());
         state.mark_draining();

@@ -11,9 +11,7 @@ use media::{
     GstRuntime, PeerEvents, PeerRole, PeerSession, PeerState, RtpPacket, RtpStreamInfo,
     is_probable_video_keyframe, stream_info,
 };
-use parking_lot::RwLock;
-#[cfg(test)]
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -120,7 +118,6 @@ pub struct RoomManager {
     metrics: AppMetrics,
     config: RoomManagerConfig,
     inner: Arc<RwLock<Rooms>>,
-    #[cfg(test)]
     meeting_sdp_offer_test_hook: Arc<Mutex<Option<MeetingSdpOfferTestHook>>>,
     #[cfg(test)]
     publisher_keyframe_requests: Arc<AtomicUsize>,
@@ -170,27 +167,27 @@ struct RoomPeerEvents {
     role: PeerRole,
 }
 
-#[cfg(test)]
 #[derive(Clone, Default)]
-struct MeetingSdpOfferTestHook {
+pub struct MeetingSdpOfferTestHook {
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
 
-#[cfg(test)]
 impl MeetingSdpOfferTestHook {
-    async fn wait_started(&self) {
+    pub async fn wait_started(&self) {
         self.started.notified().await;
     }
 
+    #[allow(dead_code)]
     fn signal_started(&self) {
         self.started.notify_one();
     }
 
-    fn release(&self) {
+    pub fn release(&self) {
         self.release.notify_one();
     }
 
+    #[allow(dead_code)]
     async fn wait_release(&self) {
         self.release.notified().await;
     }
@@ -244,7 +241,6 @@ impl RoomManager {
             inner: Arc::new(RwLock::new(Rooms {
                 rooms: HashMap::new(),
             })),
-            #[cfg(test)]
             meeting_sdp_offer_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publisher_keyframe_requests: Arc::new(AtomicUsize::new(0)),
@@ -319,8 +315,8 @@ impl RoomManager {
         snapshot
     }
 
-    #[cfg(test)]
-    fn install_meeting_sdp_offer_test_hook(&self) -> MeetingSdpOfferTestHook {
+    #[doc(hidden)]
+    pub fn install_meeting_sdp_offer_test_hook(&self) -> MeetingSdpOfferTestHook {
         let hook = MeetingSdpOfferTestHook::default();
         *self.meeting_sdp_offer_test_hook.lock() = Some(hook.clone());
         hook
@@ -1201,18 +1197,17 @@ impl RoomManager {
                     .clone()
             };
 
-            let answer_sdp = peer.negotiate_as_answerer(offer_sdp).await?;
-            peer.play().await?;
-            #[cfg(test)]
             let test_hook = {
                 let mut hook_slot = self.meeting_sdp_offer_test_hook.lock();
                 hook_slot.take()
             };
-            #[cfg(test)]
             if let Some(hook) = test_hook {
                 hook.signal_started();
                 hook.wait_release().await;
             }
+
+            let answer_sdp = peer.negotiate_as_answerer(offer_sdp).await?;
+            peer.play().await?;
 
             let g = self.inner.read();
             let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
@@ -3053,7 +3048,9 @@ a=ssrc:1234 msid:test audio0\r\n"
                 .await
         });
 
-        hook.wait_started().await;
+        tokio::time::timeout(Duration::from_secs(10), hook.wait_started())
+            .await
+            .expect("negotiation should reach test hook");
         let bumped_revision = manager
             .meeting_join(room, "bob".to_string(), Some("Bob".to_string()))
             .expect("bob joins during alice negotiation");
