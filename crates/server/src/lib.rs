@@ -370,40 +370,108 @@ async fn whep_post(
 async fn whip_patch(
     State(state): State<AppState>,
     Path((room, pub_id)): Path<(String, String)>,
-    Json(payload): Json<IceIn>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    match state
-        .rooms()
-        .whip_trickle(
-            RoomId(room),
-            &pub_id,
-            payload.mline_index,
-            payload.candidate,
-        )
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => TransportError::from_anyhow(e).into_response(),
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.starts_with("application/sdp") {
+        let offer_sdp = match std::str::from_utf8(&body) {
+            Ok(s) => s.to_string(),
+            Err(_) => return TransportError::invalid_request("invalid utf8 SDP").into_response(),
+        };
+
+        match state
+            .rooms()
+            .whip_renegotiate(RoomId(room), &pub_id, offer_sdp)
+            .await
+        {
+            Ok(answer_sdp) => {
+                let mut h = HeaderMap::new();
+                h.insert("content-type", "application/sdp".parse().unwrap());
+                (StatusCode::OK, h, answer_sdp).into_response()
+            }
+            Err(e) => TransportError::from_anyhow(e).into_response(),
+        }
+    } else {
+        let payload: IceIn = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return TransportError::invalid_request(format!("invalid ICE json: {err}"))
+                    .into_response();
+            }
+        };
+
+        match state
+            .rooms()
+            .whip_trickle(
+                RoomId(room),
+                &pub_id,
+                payload.mline_index,
+                payload.candidate,
+            )
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => TransportError::from_anyhow(e).into_response(),
+        }
     }
 }
 
 async fn whep_patch(
     State(state): State<AppState>,
     Path((room, sub_id)): Path<(String, String)>,
-    Json(payload): Json<IceIn>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    match state
-        .rooms()
-        .whep_trickle(
-            RoomId(room),
-            &sub_id,
-            payload.mline_index,
-            payload.candidate,
-        )
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => TransportError::from_anyhow(e).into_response(),
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.starts_with("application/sdp") {
+        let offer_sdp = match std::str::from_utf8(&body) {
+            Ok(s) => s.to_string(),
+            Err(_) => return TransportError::invalid_request("invalid utf8 SDP").into_response(),
+        };
+
+        match state
+            .rooms()
+            .whep_renegotiate(RoomId(room), &sub_id, offer_sdp)
+            .await
+        {
+            Ok(answer_sdp) => {
+                let mut h = HeaderMap::new();
+                h.insert("content-type", "application/sdp".parse().unwrap());
+                (StatusCode::OK, h, answer_sdp).into_response()
+            }
+            Err(e) => TransportError::from_anyhow(e).into_response(),
+        }
+    } else {
+        let payload: IceIn = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return TransportError::invalid_request(format!("invalid ICE json: {err}"))
+                    .into_response();
+            }
+        };
+
+        match state
+            .rooms()
+            .whep_trickle(
+                RoomId(room),
+                &sub_id,
+                payload.mline_index,
+                payload.candidate,
+            )
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => TransportError::from_anyhow(e).into_response(),
+        }
     }
 }
 
@@ -566,6 +634,10 @@ mod tests {
     }
 
     fn browser_like_offer_sdp() -> String {
+        browser_like_offer_sdp_with_transport("someufrag", "somepassword1234567890")
+    }
+
+    fn browser_like_offer_sdp_with_transport(ice_ufrag: &str, ice_pwd: &str) -> String {
         "\
 v=0\r\n\
 o=- 4611733055804614137 2 IN IP4 127.0.0.1\r\n\
@@ -576,8 +648,8 @@ a=msid-semantic: WMS\r\n\
 m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
 c=IN IP4 0.0.0.0\r\n\
 a=rtcp:9 IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:someufrag\r\n\
-a=ice-pwd:somepassword1234567890\r\n\
+a=ice-ufrag:{ice_ufrag}\r\n\
+a=ice-pwd:{ice_pwd}\r\n\
 a=ice-options:trickle\r\n\
 a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
 a=setup:actpass\r\n\
@@ -591,8 +663,8 @@ a=ssrc:1234 msid:test audio0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
 c=IN IP4 0.0.0.0\r\n\
 a=rtcp:9 IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:someufrag\r\n\
-a=ice-pwd:somepassword1234567890\r\n\
+a=ice-ufrag:{ice_ufrag}\r\n\
+a=ice-pwd:{ice_pwd}\r\n\
 a=ice-options:trickle\r\n\
 a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
 a=setup:actpass\r\n\
@@ -602,10 +674,15 @@ a=rtcp-mux\r\n\
 a=rtpmap:96 VP8/90000\r\n\
 a=ssrc:5678 cname:test\r\n\
 a=ssrc:5678 msid:test video0\r\n"
-            .to_string()
+            .replace("{ice_ufrag}", ice_ufrag)
+            .replace("{ice_pwd}", ice_pwd)
     }
 
     fn browser_like_subscribe_offer_sdp() -> String {
+        browser_like_subscribe_offer_sdp_with_transport("subufrag", "subpassword1234567890")
+    }
+
+    fn browser_like_subscribe_offer_sdp_with_transport(ice_ufrag: &str, ice_pwd: &str) -> String {
         "\
 v=0\r\n\
 o=- 4611733055804614138 2 IN IP4 127.0.0.1\r\n\
@@ -615,8 +692,8 @@ a=group:BUNDLE 0 1\r\n\
 m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
 c=IN IP4 0.0.0.0\r\n\
 a=rtcp:9 IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:subufrag\r\n\
-a=ice-pwd:subpassword1234567890\r\n\
+a=ice-ufrag:{ice_ufrag}\r\n\
+a=ice-pwd:{ice_pwd}\r\n\
 a=ice-options:trickle\r\n\
 a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
 a=setup:actpass\r\n\
@@ -627,8 +704,8 @@ a=rtpmap:111 opus/48000/2\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
 c=IN IP4 0.0.0.0\r\n\
 a=rtcp:9 IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:subufrag\r\n\
-a=ice-pwd:subpassword1234567890\r\n\
+a=ice-ufrag:{ice_ufrag}\r\n\
+a=ice-pwd:{ice_pwd}\r\n\
 a=ice-options:trickle\r\n\
 a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
 a=setup:actpass\r\n\
@@ -636,7 +713,8 @@ a=mid:1\r\n\
 a=recvonly\r\n\
 a=rtcp-mux\r\n\
 a=rtpmap:96 VP8/90000\r\n"
-            .to_string()
+            .replace("{ice_ufrag}", ice_ufrag)
+            .replace("{ice_pwd}", ice_pwd)
     }
 
     async fn spawn_ws_app(
@@ -655,6 +733,11 @@ a=rtpmap:96 VP8/90000\r\n"
     async fn ws_connect(url: &str) -> WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
         let (stream, _) = connect_async(url).await.expect("ws connect succeeds");
         stream
+    }
+
+    fn extract_transport_attr(sdp: &str, prefix: &str) -> Option<String> {
+        sdp.lines()
+            .find_map(|line| line.strip_prefix(prefix).map(|rest| rest.trim().to_string()))
     }
 
     async fn ws_rpc(
@@ -1000,6 +1083,74 @@ a=rtpmap:96 VP8/90000\r\n"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn whip_patch_accepts_sdp_ice_restart_offer() {
+        let rooms = manager();
+        let publish_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whip-restart")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp_with_transport(
+                        "someufrag",
+                        "somepassword1234567890",
+                    )))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(publish_response.status(), StatusCode::CREATED);
+        let location = publish_response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8")
+            .to_string();
+        let initial_answer = String::from_utf8(
+            to_bytes(publish_response.into_body(), usize::MAX)
+                .await
+                .expect("initial body readable")
+                .to_vec(),
+        )
+        .expect("initial answer utf-8");
+        assert!(initial_answer.contains("m=audio"));
+        assert!(initial_answer.contains("m=video"));
+
+        let restart_response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp_with_transport(
+                        "restartufrag",
+                        "restartpassword1234567890",
+                    )))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("restart response available");
+
+        assert_eq!(restart_response.status(), StatusCode::OK);
+        assert_eq!(
+            restart_response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/sdp"
+        );
+        let restarted_answer = String::from_utf8(
+            to_bytes(restart_response.into_body(), usize::MAX)
+                .await
+                .expect("restart body readable")
+                .to_vec(),
+        )
+        .expect("restart answer utf-8");
+        assert!(restarted_answer.contains("m=audio"));
+        assert!(restarted_answer.contains("m=video"));
+        assert!(extract_transport_attr(&restarted_answer, "a=ice-ufrag:").is_some());
+        assert!(extract_transport_attr(&restarted_answer, "a=ice-pwd:").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn whip_delete_is_idempotent_for_already_stopped_publisher() {
         let rooms = manager();
         let publish_response = app(rooms.clone())
@@ -1136,6 +1287,88 @@ a=rtpmap:96 VP8/90000\r\n"
         let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
         assert!(answer.contains("m=audio"));
         assert!(answer.contains("m=video"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_patch_accepts_sdp_ice_restart_offer() {
+        let rooms = manager();
+        let publisher_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whep-restart")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(publisher_response.status(), StatusCode::CREATED);
+
+        rooms
+            .seed_broadcast_streams_for_test(RoomId("broadcast-whep-restart".to_string()))
+            .expect("seeded broadcast streams");
+
+        let subscribe_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/broadcast-whep-restart")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(subscribe_response.status(), StatusCode::CREATED);
+        let location = subscribe_response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8")
+            .to_string();
+        let initial_answer = String::from_utf8(
+            to_bytes(subscribe_response.into_body(), usize::MAX)
+                .await
+                .expect("initial body readable")
+                .to_vec(),
+        )
+        .expect("initial answer utf-8");
+        assert!(initial_answer.contains("m=audio"));
+        assert!(initial_answer.contains("m=video"));
+
+        let restart_response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp_with_transport(
+                        "restartsubufrag",
+                        "restartsubpassword1234567890",
+                    )))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("restart response available");
+
+        assert_eq!(restart_response.status(), StatusCode::OK);
+        assert_eq!(
+            restart_response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/sdp"
+        );
+        let restarted_answer = String::from_utf8(
+            to_bytes(restart_response.into_body(), usize::MAX)
+                .await
+                .expect("restart body readable")
+                .to_vec(),
+        )
+        .expect("restart answer utf-8");
+        assert!(restarted_answer.contains("m=audio"));
+        assert!(restarted_answer.contains("m=video"));
+        assert!(extract_transport_attr(&restarted_answer, "a=ice-ufrag:").is_some());
+        assert!(extract_transport_attr(&restarted_answer, "a=ice-pwd:").is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1689,6 +1922,72 @@ a=rtpmap:96 VP8/90000\r\n"
 
         alice.close(None).await.expect("alice close succeeds");
         bob.close(None).await.expect("bob close succeeds");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_route_allows_ice_restart_to_rotate_answer_credentials() {
+        let rooms = manager();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+
+        let join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-ice-restart",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let revision = join["revision"].as_u64().expect("join revision");
+
+        let initial_answer = ws_rpc(
+            &mut alice,
+            2,
+            "sdp_offer",
+            json!({
+                "revision": revision,
+                "offer_sdp": browser_like_offer_sdp_with_transport("someufrag", "somepassword1234567890")
+            }),
+        )
+        .await;
+        let initial_answer_sdp = initial_answer["answer_sdp"]
+            .as_str()
+            .expect("initial answer sdp");
+        let initial_ice_ufrag = extract_transport_attr(initial_answer_sdp, "a=ice-ufrag:")
+            .expect("initial answer ice ufrag");
+        let initial_ice_pwd =
+            extract_transport_attr(initial_answer_sdp, "a=ice-pwd:").expect("initial answer ice pwd");
+
+        let restarted_answer = ws_rpc(
+            &mut alice,
+            3,
+            "sdp_offer",
+            json!({
+                "revision": revision,
+                "offer_sdp": browser_like_offer_sdp_with_transport("restartufrag", "restartpassword1234567890")
+            }),
+        )
+        .await;
+        let restarted_answer_sdp = restarted_answer["answer_sdp"]
+            .as_str()
+            .expect("restarted answer sdp");
+        let restarted_ice_ufrag = extract_transport_attr(restarted_answer_sdp, "a=ice-ufrag:")
+            .expect("restarted answer ice ufrag");
+        let restarted_ice_pwd =
+            extract_transport_attr(restarted_answer_sdp, "a=ice-pwd:").expect("restarted answer ice pwd");
+
+        assert_ne!(restarted_ice_ufrag, initial_ice_ufrag);
+        assert_ne!(restarted_ice_pwd, initial_ice_pwd);
+
+        alice.close(None).await.expect("alice close succeeds");
         server_handle.abort();
     }
 

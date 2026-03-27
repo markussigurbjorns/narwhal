@@ -82,6 +82,8 @@ struct PeerInner {
 
     // Last produced local SDP (answer)
     local_sdp: Arc<RwLock<Option<String>>>,
+    // Last accepted remote SDP offer
+    remote_offer_sdp: Arc<RwLock<Option<String>>>,
 
     events: Option<Arc<dyn PeerEvents>>,
 
@@ -156,6 +158,7 @@ impl PeerSession {
                 pipeline,
                 webrtcbin,
                 local_sdp: Arc::new(RwLock::new(None)),
+                remote_offer_sdp: Arc::new(RwLock::new(None)),
                 events,
                 ice_tx,
                 handlers: Arc::new(RwLock::new(PeerHandlers::default())),
@@ -322,8 +325,12 @@ impl PeerSession {
         *self.inner.whep_streams.write() = streams;
     }
 
-    pub fn take_whep_injector(&self) -> Option<crate::RtpInjector> {
-        self.inner.whep_injector.write().take()
+    pub fn whep_injector_sender(&self) -> Option<tokio::sync::mpsc::Sender<crate::RtpPacket>> {
+        self.inner
+            .whep_injector
+            .read()
+            .as_ref()
+            .map(crate::RtpInjector::sender)
     }
 
     /// Trickle ICE candidate from client -> server.
@@ -374,6 +381,7 @@ impl PeerSession {
         let peer_id = self.inner.peer_id.clone();
         let role = self.inner.role;
         let local_sdp_store = self.inner.local_sdp.clone();
+        let remote_offer_sdp_store = self.inner.remote_offer_sdp.clone();
         let events = self.inner.events.clone();
         let whep_streams = self.inner.whep_streams.clone();
         let whep_injector = self.inner.whep_injector.clone();
@@ -395,6 +403,7 @@ impl PeerSession {
                 let role_for_remote = role;
                 let events_for_remote = events.clone();
                 let local_sdp_store_for_remote = local_sdp_store.clone();
+                let remote_offer_sdp_store_for_remote = remote_offer_sdp_store.clone();
                 let whep_streams_for_remote = whep_streams.clone();
                 let whep_injector_for_remote = whep_injector.clone();
 
@@ -424,7 +433,7 @@ impl PeerSession {
                             gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
                         );
                         let streams = whep_streams_for_remote.read().clone();
-                        if !streams.is_empty() {
+                        if !streams.is_empty() && whep_injector_for_remote.read().is_none() {
                             let on_video_keyframe_request = keyframe_events.clone().map(|events| {
                                 let peer_id = keyframe_peer_id.clone();
                                 Arc::new(move || {
@@ -468,6 +477,8 @@ impl PeerSession {
                     let role_for_answer = role_for_remote;
                     let events_for_answer = events_for_remote.clone();
                     let local_sdp_store_for_answer = local_sdp_store_for_remote.clone();
+                    let remote_offer_sdp_store_for_answer = remote_offer_sdp_store_for_remote.clone();
+                    let offer_sdp_for_answer = offer_sdp.clone();
 
                     let mut tx = Some(tx);
 
@@ -522,12 +533,23 @@ impl PeerSession {
                                 {
                                     let previous_local_sdp =
                                         local_sdp_store_for_answer.read().clone();
+                                    let previous_remote_offer_sdp =
+                                        remote_offer_sdp_store_for_answer.read().clone();
+                                    let preserve_transport_identity = !meeting_offer_requests_ice_restart(
+                                        &offer_sdp_for_answer,
+                                        previous_remote_offer_sdp.as_deref(),
+                                    );
                                     tracing::debug!(
                                         peer_id = %peer_id_for_answer,
                                         raw_answer_sdp = %txt,
                                         "raw meeting answer SDP from webrtcbin"
                                     );
-                                    normalize_meeting_answer_sdp(txt, previous_local_sdp.as_deref())
+                                    normalize_meeting_answer_sdp(
+                                        txt,
+                                        preserve_transport_identity
+                                            .then_some(previous_local_sdp.as_deref())
+                                            .flatten(),
+                                    )
                                 } else {
                                     txt
                                 };
@@ -548,6 +570,8 @@ impl PeerSession {
                                     }
                                 }
                                 *local_sdp_store_for_answer.write() = Some(txt.clone());
+                                *remote_offer_sdp_store_for_answer.write() =
+                                    Some(offer_sdp_for_answer.clone());
                                 if let Some(ev) = &events_for_answer {
                                     ev.on_state(&peer_id_for_answer, PeerState::Connected);
                                 }
@@ -768,6 +792,25 @@ fn normalize_meeting_answer_sdp(sdp: String, previous_local_sdp: Option<&str>) -
     let mut joined = out.join("\r\n");
     joined.push_str("\r\n");
     joined
+}
+
+fn meeting_offer_requests_ice_restart(
+    offer_sdp: &str,
+    previous_offer_sdp: Option<&str>,
+) -> bool {
+    let Some(previous_offer_sdp) = previous_offer_sdp else {
+        return false;
+    };
+
+    let current = parse_preserved_transport_attrs(offer_sdp);
+    let previous = parse_preserved_transport_attrs(previous_offer_sdp);
+    if current.is_empty() || previous.is_empty() || current.len() != previous.len() {
+        return false;
+    }
+
+    current.iter().zip(previous.iter()).any(|(current, previous)| {
+        current.ice_ufrag != previous.ice_ufrag || current.ice_pwd != previous.ice_pwd
+    })
 }
 
 fn normalize_session_level_line(mut line: String) -> String {
@@ -1005,7 +1048,10 @@ impl MediaSectionNormalizer {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_meeting_answer_sdp, parse_preserved_transport_attrs};
+    use super::{
+        meeting_offer_requests_ice_restart, normalize_meeting_answer_sdp,
+        parse_preserved_transport_attrs,
+    };
 
     #[test]
     fn normalize_meeting_answer_strips_send_simulcast_and_rids() {
@@ -1153,6 +1199,36 @@ a=fingerprint:sha-256 BB:BB:BB:BB\r\n";
             parsed[1].fingerprint.as_deref(),
             Some("a=fingerprint:sha-256 BB:BB:BB:BB")
         );
+    }
+
+    #[test]
+    fn detects_ice_restart_when_offer_credentials_change() {
+        let previous = "\
+v=0\r\n\
+o=- 1 1 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=ice-ufrag:oldaudio\r\n\
+a=ice-pwd:oldaudiopwd\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=ice-ufrag:oldvideo\r\n\
+a=ice-pwd:oldvideopwd\r\n";
+        let current = "\
+v=0\r\n\
+o=- 1 2 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=ice-ufrag:newaudio\r\n\
+a=ice-pwd:newaudiopwd\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=ice-ufrag:newvideo\r\n\
+a=ice-pwd:newvideopwd\r\n";
+
+        assert!(meeting_offer_requests_ice_restart(current, Some(previous)));
+        assert!(!meeting_offer_requests_ice_restart(previous, Some(previous)));
+        assert!(!meeting_offer_requests_ice_restart(current, None));
     }
 }
 

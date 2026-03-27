@@ -12,6 +12,8 @@ use media::{
     is_probable_video_keyframe, stream_info,
 };
 use parking_lot::RwLock;
+#[cfg(test)]
+use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -116,6 +118,8 @@ pub struct RoomManager {
     metrics: AppMetrics,
     config: RoomManagerConfig,
     inner: Arc<RwLock<Rooms>>,
+    #[cfg(test)]
+    meeting_sdp_offer_test_hook: Arc<Mutex<Option<MeetingSdpOfferTestHook>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,6 +162,32 @@ struct RoomPeerEvents {
     tokio_handle: Handle,
     metrics: AppMetrics,
     role: PeerRole,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct MeetingSdpOfferTestHook {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl MeetingSdpOfferTestHook {
+    async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    fn signal_started(&self) {
+        self.started.notify_one();
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn wait_release(&self) {
+        self.release.notified().await;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +238,8 @@ impl RoomManager {
             inner: Arc::new(RwLock::new(Rooms {
                 rooms: HashMap::new(),
             })),
+            #[cfg(test)]
+            meeting_sdp_offer_test_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -275,6 +307,13 @@ impl RoomManager {
         }
 
         snapshot
+    }
+
+    #[cfg(test)]
+    fn install_meeting_sdp_offer_test_hook(&self) -> MeetingSdpOfferTestHook {
+        let hook = MeetingSdpOfferTestHook::default();
+        *self.meeting_sdp_offer_test_hook.lock() = Some(hook.clone());
+        hook
     }
 
     pub fn room_mode(&self, room: &RoomId) -> Option<RoomMode> {
@@ -1095,6 +1134,16 @@ impl RoomManager {
 
             let answer_sdp = peer.negotiate_as_answerer(offer_sdp).await?;
             peer.play().await?;
+            #[cfg(test)]
+            let test_hook = {
+                let mut hook_slot = self.meeting_sdp_offer_test_hook.lock();
+                hook_slot.take()
+            };
+            #[cfg(test)]
+            if let Some(hook) = test_hook {
+                hook.signal_started();
+                hook.wait_release().await;
+            }
 
             let g = self.inner.read();
             let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
@@ -1783,6 +1832,40 @@ impl RoomManager {
         pub_peer.add_ice_candidate(mline, cand).await
     }
 
+    pub async fn whip_renegotiate(
+        &self,
+        room: RoomId,
+        pub_id: &str,
+        offer_sdp: String,
+    ) -> Result<String> {
+        let peer = {
+            let g = self.inner.read();
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+            Self::require_broadcast_mode(rs)?;
+            let pub_sess = rs.publisher.as_ref().ok_or_else(no_publisher)?;
+            if pub_sess.id != pub_id {
+                return Err(publisher_id_mismatch());
+            }
+            pub_sess.peer.clone()
+        };
+
+        let answer = peer.negotiate_as_answerer(offer_sdp).await?;
+        peer.play().await?;
+
+        {
+            let g = self.inner.read();
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+            Self::require_broadcast_mode(rs)?;
+            let pub_sess = rs.publisher.as_ref().ok_or_else(no_publisher)?;
+            if pub_sess.id != pub_id {
+                return Err(publisher_id_mismatch());
+            }
+            pub_sess.ice.clear();
+        }
+
+        Ok(answer)
+    }
+
     /// GET /whip/:room/:pub/ice  (server ICE -> client)
     pub fn whip_drain_ice(
         &self,
@@ -1868,8 +1951,8 @@ impl RoomManager {
             peer.set_whep_streams(stream_infos);
             peer.start().await?;
             let answer = peer.negotiate_as_answerer(offer_sdp).await?;
-            let injector = peer
-                .take_whep_injector()
+            let injector_tx = peer
+                .whep_injector_sender()
                 .ok_or_else(|| whep_injector_not_created())?;
             peer.play().await?;
 
@@ -1895,7 +1978,7 @@ impl RoomManager {
                         id: sub_id.clone(),
                         peer,
                         ice,
-                        injector_tx: injector.tx.clone(),
+                        injector_tx,
                         injector_overflow_streak: 0,
                         subscribed_at: Instant::now(),
                         first_rtp_forwarded: false,
@@ -1952,6 +2035,48 @@ impl RoomManager {
         };
 
         sub_peer.add_ice_candidate(mline, cand).await
+    }
+
+    pub async fn whep_renegotiate(
+        &self,
+        room: RoomId,
+        sub_id: &str,
+        offer_sdp: String,
+    ) -> Result<String> {
+        let (peer, stream_infos, ice) = {
+            let g = self.inner.read();
+            let rs = g.rooms.get(&room).ok_or_else(room_not_found)?;
+            Self::require_broadcast_mode(rs)?;
+            rs.publisher.as_ref().ok_or_else(no_publisher)?;
+            let sub = rs
+                .subscribers
+                .get(sub_id)
+                .ok_or_else(subscriber_not_found)?;
+            (
+                sub.peer.clone(),
+                rs.broadcast_streams.values().cloned().collect::<Vec<_>>(),
+                sub.ice.clone(),
+            )
+        };
+
+        if stream_infos.is_empty() {
+            return Err(publisher_not_flowing());
+        }
+
+        peer.set_whep_streams(stream_infos);
+        let answer = peer.negotiate_as_answerer(offer_sdp).await?;
+        peer.play().await?;
+        ice.clear();
+
+        if let Err(err) = self.request_publisher_keyframe(room).await {
+            tracing::warn!(
+                subscriber_id = %sub_id,
+                cause = classify_negotiation_error(&err),
+                "failed to request keyframe after WHEP renegotiation: {err:#}"
+            );
+        }
+
+        Ok(answer)
     }
 
     /// GET /whep/:room/:sub/ice  (server ICE -> client)
@@ -2591,6 +2716,68 @@ mod tests {
             .expect("remaining participants should be listable");
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].participant_id, "bob");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn meeting_sdp_offer_rejects_when_room_revision_advances_during_negotiation() {
+        let manager = manager();
+        let room = RoomId("room-negotiation-superseded".to_string());
+        let revision = manager
+            .meeting_join(room.clone(), "alice".to_string(), Some("Alice".to_string()))
+            .expect("alice joins");
+        let hook = manager.install_meeting_sdp_offer_test_hook();
+
+        let manager_for_offer = manager.clone();
+        let room_for_offer = room.clone();
+        let offer_task = tokio::spawn(async move {
+            manager_for_offer
+                .meeting_sdp_offer(
+                    room_for_offer,
+                    "alice",
+                    revision,
+                    "v=0\r\n\
+o=- 4611733055804614137 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:someufrag\r\n\
+a=ice-pwd:somepassword1234567890\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:1234 cname:test\r\n\
+a=ssrc:1234 msid:test audio0\r\n"
+                    .to_string(),
+                )
+                .await
+        });
+
+        hook.wait_started().await;
+        let bumped_revision = manager
+            .meeting_join(room, "bob".to_string(), Some("Bob".to_string()))
+            .expect("bob joins during alice negotiation");
+        assert!(bumped_revision > revision);
+        hook.release();
+
+        let result = offer_task.await.expect("offer task should join");
+        let err = match result {
+            Ok(_) => panic!("superseded negotiation should fail"),
+            Err(err) => err,
+        };
+        let core = err.downcast_ref::<Error>().expect("core error expected");
+        assert!(matches!(
+            core,
+            Error::NegotiationSuperseded { offered, current }
+            if *offered == revision && *current == bumped_revision
+        ));
     }
 
     #[test]

@@ -115,13 +115,13 @@ Failure examples:
 - `409` room is in meeting mode
 - `500` media/runtime failures
 
-### Publisher ICE Trickle
+### Publisher PATCH
 
 Route:
 
 - `PATCH /whip/:room/:publisher_id`
 
-Request body:
+JSON request body for ICE trickle:
 
 ```json
 {
@@ -130,9 +130,20 @@ Request body:
 }
 ```
 
-Success response:
+Success response for ICE trickle:
 
 - `204 No Content`
+
+Raw SDP request body for renegotiation / ICE restart:
+
+- `Content-Type: application/sdp`
+- body is a new SDP offer for the existing publisher resource
+
+Success response for SDP renegotiation:
+
+- `200 OK`
+- `Content-Type: application/sdp`
+- body is the SDP answer
 
 ### Drain Server ICE For Publisher
 
@@ -166,6 +177,8 @@ Notes:
 - current behavior is replace-on-new-publisher
 - starting a new publisher replaces the previous one for the room
 - deleting the same publisher resource more than once is treated as a no-op
+- `PATCH` on an existing publisher resource now accepts either JSON ICE trickle or raw SDP renegotiation
+- WHIP restart offers are accepted on the existing resource, but answer-side ICE credential rotation is still delegated to the underlying media stack and is not yet asserted as a stable wire guarantee
 
 ### Subscribe With WHEP
 
@@ -197,13 +210,13 @@ Typical failure causes:
 - `422` publisher has not produced RTP yet
 - `409` room is in meeting mode
 
-### Subscriber ICE Trickle
+### Subscriber PATCH
 
 Route:
 
 - `PATCH /whep/:room/:subscriber_id`
 
-Request body:
+JSON request body for ICE trickle:
 
 ```json
 {
@@ -212,9 +225,20 @@ Request body:
 }
 ```
 
-Success response:
+Success response for ICE trickle:
 
 - `204 No Content`
+
+Raw SDP request body for renegotiation / ICE restart:
+
+- `Content-Type: application/sdp`
+- body is a new SDP offer for the existing subscriber resource
+
+Success response for SDP renegotiation:
+
+- `200 OK`
+- `Content-Type: application/sdp`
+- body is the SDP answer
 
 ### Drain Server ICE For Subscriber
 
@@ -246,6 +270,8 @@ Success response:
 Notes:
 
 - deleting the same subscriber resource more than once is treated as a no-op
+- `PATCH` on an existing subscriber resource now accepts either JSON ICE trickle or raw SDP renegotiation
+- WHEP restart offers are accepted on the existing resource, but answer-side ICE credential rotation is not yet documented as a stable guarantee
 
 ## Broadcast Control API
 
@@ -467,6 +493,7 @@ Current behavior:
 - the server creates the underlying media peer lazily on first SDP offer
 - revisions greater than the current room revision are rejected
 - if the room revision advances while an SDP answer is being generated, the offer is rejected with a conflict-style error and the client must retry `sdp_offer` against the newer revision instead of applying a stale answer
+- if the client sends a new offer with changed ICE credentials, the server treats that as an ICE restart and allows the answer to rotate its own ICE credentials instead of preserving the previous transport identity
 
 #### `trickle_ice`
 
@@ -742,6 +769,6 @@ Current limitation:
 ## Current Limitations
 
 - ICE is drained by explicit client polling
-- meeting renegotiation semantics are more explicit now, but still incomplete at the room-wide orchestration level for cases like ICE restart and broader browser recovery flows
+- meeting renegotiation semantics are more explicit now, but still incomplete at the room-wide orchestration level for broader browser recovery flows beyond the current ICE restart path
 - broadcast subscribe currently requires the publisher to already be flowing RTP
 - status codes and JSON-RPC error codes are stable enough for current tests, but the protocol should still be considered evolving

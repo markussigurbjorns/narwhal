@@ -33,6 +33,10 @@ impl IceQueue {
         }
         out
     }
+
+    pub fn clear(&self) {
+        self.q.lock().clear();
+    }
 }
 
 /// Starts a background task that collects outgoing ICE candidates from a peer
