@@ -95,6 +95,13 @@ struct PeerInner {
     whep_injector: Arc<RwLock<Option<crate::RtpInjector>>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WebRtcIceConfig {
+    stun_server: Option<String>,
+    turn_server: Option<String>,
+    transport_policy: Option<gst_webrtc::WebRTCICETransportPolicy>,
+}
+
 impl PeerSession {
     /// Create a new peer session with its own pipeline + webrtcbin.
     ///
@@ -1049,9 +1056,12 @@ impl MediaSectionNormalizer {
 #[cfg(test)]
 mod tests {
     use super::{
-        meeting_offer_requests_ice_restart, normalize_meeting_answer_sdp,
-        parse_preserved_transport_attrs,
+        WebRtcIceConfig, apply_webrtc_ice_config, meeting_offer_requests_ice_restart,
+        normalize_meeting_answer_sdp, parse_ice_transport_policy, parse_preserved_transport_attrs,
     };
+    use glib::object::ObjectExt;
+    use gstreamer as gst;
+    use gstreamer_webrtc as gst_webrtc;
 
     #[test]
     fn normalize_meeting_answer_strips_send_simulcast_and_rids() {
@@ -1230,6 +1240,56 @@ a=ice-pwd:newvideopwd\r\n";
         assert!(!meeting_offer_requests_ice_restart(previous, Some(previous)));
         assert!(!meeting_offer_requests_ice_restart(current, None));
     }
+
+    #[test]
+    fn parses_ice_transport_policy_labels() {
+        assert_eq!(
+            parse_ice_transport_policy("all"),
+            Some(gst_webrtc::WebRTCICETransportPolicy::All)
+        );
+        assert_eq!(
+            parse_ice_transport_policy("relay"),
+            Some(gst_webrtc::WebRTCICETransportPolicy::Relay)
+        );
+        assert_eq!(
+            parse_ice_transport_policy(" RELAY "),
+            Some(gst_webrtc::WebRTCICETransportPolicy::Relay)
+        );
+        assert_eq!(parse_ice_transport_policy("bogus"), None);
+        assert_eq!(parse_ice_transport_policy(""), None);
+    }
+
+    #[test]
+    fn apply_webrtc_ice_config_sets_turn_and_relay_policy() {
+        gst::init().expect("gstreamer init");
+        let webrtcbin = gst::ElementFactory::make("webrtcbin")
+            .build()
+            .expect("webrtcbin available");
+
+        apply_webrtc_ice_config(
+            &webrtcbin,
+            &WebRtcIceConfig {
+                stun_server: Some("stun://stun.example.com:3478".to_string()),
+                turn_server: Some(
+                    "turn://user:pass@turn.example.com:3478?transport=udp".to_string(),
+                ),
+                transport_policy: Some(gst_webrtc::WebRTCICETransportPolicy::Relay),
+            },
+        );
+
+        assert_eq!(
+            webrtcbin.property::<String>("stun-server"),
+            "stun://stun.example.com:3478"
+        );
+        assert_eq!(
+            webrtcbin.property::<String>("turn-server"),
+            "turn://user:pass@turn.example.com:3478?transport=udp"
+        );
+        assert_eq!(
+            webrtcbin.property::<gst_webrtc::WebRTCICETransportPolicy>("ice-transport-policy"),
+            gst_webrtc::WebRTCICETransportPolicy::Relay
+        );
+    }
 }
 
 fn parse_offer_sdp(sdp_txt: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {
@@ -1327,18 +1387,49 @@ fn is_video_rtp_caps(caps: &gst::Caps) -> bool {
     })
 }
 
-fn apply_webrtc_ice_config_from_env(webrtcbin: &gst::Element) {
+fn parse_ice_transport_policy(
+    value: &str,
+) -> Option<gst_webrtc::WebRTCICETransportPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "all" => Some(gst_webrtc::WebRTCICETransportPolicy::All),
+        "relay" => Some(gst_webrtc::WebRTCICETransportPolicy::Relay),
+        _ => None,
+    }
+}
+
+fn webrtc_ice_config_from_env() -> WebRtcIceConfig {
+    WebRtcIceConfig {
+        stun_server: env::var("NARWHAL_STUN_SERVER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        turn_server: env::var("NARWHAL_TURN_SERVER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        transport_policy: env::var("NARWHAL_ICE_TRANSPORT_POLICY")
+            .ok()
+            .and_then(|value| parse_ice_transport_policy(&value)),
+    }
+}
+
+fn apply_webrtc_ice_config(webrtcbin: &gst::Element, config: &WebRtcIceConfig) {
     // GStreamer expects:
     //   stun-server = "stun://host:port"
     //   turn-server = "turn://user:pass@host:port?transport=udp"
-    if let Ok(stun) = env::var("NARWHAL_STUN_SERVER") {
-        if !stun.trim().is_empty() {
-            webrtcbin.set_property("stun-server", stun.trim());
-        }
+    if let Some(stun) = config.stun_server.as_deref() {
+        webrtcbin.set_property("stun-server", stun);
     }
-    if let Ok(turn) = env::var("NARWHAL_TURN_SERVER") {
-        if !turn.trim().is_empty() {
-            webrtcbin.set_property("turn-server", turn.trim());
-        }
+    if let Some(turn) = config.turn_server.as_deref() {
+        webrtcbin.set_property("turn-server", turn);
     }
+    if let Some(policy) = config.transport_policy {
+        webrtcbin.set_property("ice-transport-policy", policy);
+    }
+}
+
+fn apply_webrtc_ice_config_from_env(webrtcbin: &gst::Element) {
+    let config = webrtc_ice_config_from_env();
+    apply_webrtc_ice_config(webrtcbin, &config);
 }

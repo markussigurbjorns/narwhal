@@ -61,4 +61,17 @@ Current limitation:
 
 The media layer also reads environment variables directly for WebRTC ICE configuration. Those are applied in `crates/media`.
 
+- `NARWHAL_STUN_SERVER`
+  - Example: `stun://stun.example.com:3478`
+  - Sets `webrtcbin`'s `stun-server` property.
+
+- `NARWHAL_TURN_SERVER`
+  - Example: `turn://user:pass@turn.example.com:3478?transport=udp`
+  - Sets `webrtcbin`'s `turn-server` property.
+
+- `NARWHAL_ICE_TRANSPORT_POLICY`
+  - Allowed values: `all`, `relay`
+  - Default: unset, which leaves the media layer on the underlying `webrtcbin` default
+  - `relay` forces relay-only ICE gathering/selection, which is the main knob needed for TURN-only deployment and browser interop testing.
+
 If you extend runtime settings further, prefer moving them into typed config structs at the crate boundary instead of scattering new `env::var` calls through room logic.
