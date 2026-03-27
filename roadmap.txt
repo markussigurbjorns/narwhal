@@ -154,14 +154,14 @@
   ~ finish ICE restart handling
   ✓ validate MID/RID/SSRC routing under simulcast
   ✓ ensure subscription changes become effective without desync
-  ~ handle publisher restart while subscribers remain connected
+  ✓ handle publisher restart while subscribers remain connected
   ~ handle joining mid-stream and keyframe warmup robustly
 
   Tests to add:
 
   - simultaneous subscribe/unsubscribe from multiple peers
   ✓ stale revision rejection and recovery
-  - disconnect during negotiation
+  ✓ disconnect during negotiation
   ✓ reconnect after WebSocket loss
   ✓ join while publisher already active
   ✓ publisher replace/restart case
