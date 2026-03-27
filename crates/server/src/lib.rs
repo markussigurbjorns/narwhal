@@ -625,9 +625,51 @@ mod tests {
     use narwhal_core::{MediaKind, MeetingPublishTrack, MidRoutingInfo, RoomId, RoomManager, RoomMode};
     use serde_json::{Value, json};
     use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
     use tower::util::ServiceExt;
+
+    static ICE_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // Test-only env mutation guarded by ICE_ENV_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(previous) => {
+                    // Test-only env mutation guarded by ICE_ENV_LOCK.
+                    unsafe {
+                        std::env::set_var(self.key, previous);
+                    }
+                }
+                None => {
+                    // Test-only env mutation guarded by ICE_ENV_LOCK.
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn lock_ice_env() -> MutexGuard<'static, ()> {
+        ICE_ENV_LOCK.lock().expect("ice env lock")
+    }
 
     fn manager() -> RoomManager {
         let gst = GstRuntime::init().expect("gstreamer runtime must initialize");
@@ -1158,6 +1200,46 @@ a=rtpmap:96 VP8/90000\r\n"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn whip_post_accepts_browser_like_sdp_offer_under_relay_only_policy() {
+        let _env_lock = lock_ice_env();
+        let _policy = ScopedEnvVar::set("NARWHAL_ICE_TRANSPORT_POLICY", "relay");
+
+        let response = app(manager())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whip-relay")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/sdp"
+        );
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8");
+        assert!(location.starts_with("/whip/broadcast-whip-relay/"));
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
+        assert!(answer.contains("m=audio"));
+        assert!(answer.contains("m=video"));
+        assert!(extract_transport_attr(&answer, "a=ice-ufrag:").is_some());
+        assert!(extract_transport_attr(&answer, "a=ice-pwd:").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn whip_patch_accepts_sdp_ice_restart_offer() {
         let rooms = manager();
         let publish_response = app(rooms.clone())
@@ -1362,6 +1444,64 @@ a=rtpmap:96 VP8/90000\r\n"
         let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
         assert!(answer.contains("m=audio"));
         assert!(answer.contains("m=video"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn whep_post_accepts_browser_like_sdp_under_relay_only_policy() {
+        let _env_lock = lock_ice_env();
+        let _policy = ScopedEnvVar::set("NARWHAL_ICE_TRANSPORT_POLICY", "relay");
+
+        let rooms = manager();
+        let publisher_response = app(rooms.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/whip/broadcast-whep-relay")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+        assert_eq!(publisher_response.status(), StatusCode::CREATED);
+
+        rooms
+            .seed_broadcast_streams_for_test(RoomId("broadcast-whep-relay".to_string()))
+            .expect("seeded broadcast streams");
+
+        let response = app(rooms)
+            .oneshot(
+                Request::builder()
+                    .uri("/whep/broadcast-whep-relay")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(browser_like_subscribe_offer_sdp()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response available");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/sdp"
+        );
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("location header present")
+            .to_str()
+            .expect("location header utf-8");
+        assert!(location.starts_with("/whep/broadcast-whep-relay/"));
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let answer = String::from_utf8(body.to_vec()).expect("answer utf-8");
+        assert!(answer.contains("m=audio"));
+        assert!(answer.contains("m=video"));
+        assert!(extract_transport_attr(&answer, "a=ice-ufrag:").is_some());
+        assert!(extract_transport_attr(&answer, "a=ice-pwd:").is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2064,6 +2204,65 @@ a=rtpmap:96 VP8/90000\r\n"
 
         assert!(!restarted_ice_ufrag.is_empty());
         assert!(!restarted_ice_pwd.is_empty());
+
+        alice.close(None).await.expect("alice close succeeds");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_route_negotiates_under_relay_only_ice_policy() {
+        let _env_lock = lock_ice_env();
+        let _policy = ScopedEnvVar::set("NARWHAL_ICE_TRANSPORT_POLICY", "relay");
+
+        let rooms = manager();
+        let (ws_url, server_handle) = match spawn_ws_app(rooms).await {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("ws app bind should succeed: {err}"),
+        };
+
+        let mut alice = ws_connect(&ws_url).await;
+
+        let join = ws_rpc(
+            &mut alice,
+            1,
+            "join",
+            json!({
+                "room": "ws-relay-only",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let revision = join["revision"].as_u64().expect("join revision");
+
+        let answer = ws_rpc(
+            &mut alice,
+            2,
+            "sdp_offer",
+            json!({
+                "revision": revision,
+                "offer_sdp": browser_like_offer_sdp()
+            }),
+        )
+        .await;
+        let answer_sdp = answer["answer_sdp"].as_str().expect("answer sdp");
+
+        assert!(answer_sdp.contains("m=audio"));
+        assert!(answer_sdp.contains("m=video"));
+        assert!(extract_transport_attr(answer_sdp, "a=ice-ufrag:").is_some());
+        assert!(extract_transport_attr(answer_sdp, "a=ice-pwd:").is_some());
+        assert_eq!(answer["negotiation_state"], json!("stable"));
+
+        let drained = ws_rpc(
+            &mut alice,
+            3,
+            "drain_ice",
+            json!({
+                "max": 8
+            }),
+        )
+        .await;
+        assert!(drained["candidates"].is_array());
 
         alice.close(None).await.expect("alice close succeeds");
         server_handle.abort();
