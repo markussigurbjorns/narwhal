@@ -151,7 +151,7 @@
 
   ~ serialize renegotiation per peer by rejecting SDP answers superseded during negotiation
   ~ make room-wide/server-driven renegotiation explicit
-  ~ finish ICE restart handling, including relay-only policy coverage
+  ~ finish ICE restart handling, including relay-only policy and restart interop coverage
   ✓ validate MID/RID/SSRC routing under simulcast
   ✓ ensure subscription changes become effective without desync
   ✓ handle publisher restart while subscribers remain connected
@@ -165,7 +165,7 @@
   ✓ reconnect after WebSocket loss
   ✓ join while publisher already active
   ✓ publisher replace/restart case
-  ~ relay-only negotiation coverage
+  ✓ relay-only negotiation coverage for meeting WS and broadcast WHIP/WHEP
   - TURN-only connectivity case
 
   Deliverables:
